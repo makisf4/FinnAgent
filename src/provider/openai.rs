@@ -1,9 +1,10 @@
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
-use super::{ModelTurn, ToolCall, Usage, api_error_message, send_with_retry};
+use super::{ModelTurn, ToolCall, Usage, api_error_message, compact_history, send_with_retry};
 use crate::config::Config;
-use crate::tools;
+
+const VISUAL_SANITIZED: &str = "[Visual Asset Sanitized for Text Reasoning]";
 
 #[derive(Clone)]
 pub struct OpenAi {
@@ -26,11 +27,14 @@ impl OpenAi {
     }
 
     pub fn push_user(&mut self, task: &str) {
+        sanitize_historical_images(&mut self.history);
         self.history.push(json!({"role": "user", "content": task}));
+        compact_history(&mut self.history, is_user_item);
     }
 
     pub fn push_user_image(&mut self, prompt: &str, data_url: &str) {
         self.history.push(image_message(prompt, data_url));
+        compact_history(&mut self.history, is_user_item);
     }
 
     pub fn push_assistant(&mut self, answer: &str) {
@@ -46,33 +50,87 @@ impl OpenAi {
         }));
     }
 
-    pub async fn create_turn(&mut self, client: &reqwest::Client) -> Result<ModelTurn> {
+    pub async fn create_turn(
+        &mut self,
+        client: &reqwest::Client,
+        tools: Vec<Value>,
+        sink: super::TextSink<'_>,
+    ) -> Result<ModelTurn> {
         let instructions = crate::agent::instructions(&self.model, &self.reasoning_effort);
-        let request = json!({
+        let mut request = json!({
             "model": self.model,
             "reasoning": {"effort": self.reasoning_effort},
             "instructions": instructions,
             "input": self.history,
-            "tools": tools::definitions(),
-            "tool_choice": "auto",
-            "parallel_tool_calls": false,
+            "stream": true,
         });
+        if !tools.is_empty() {
+            request["tools"] = Value::Array(tools);
+            request["tool_choice"] = Value::String("auto".to_owned());
+            request["parallel_tool_calls"] = Value::Bool(false);
+        }
         let request = client
             .post(format!("{}/responses", self.base_url))
             .bearer_auth(&self.api_key)
             .json(&request);
         let response = send_with_retry(request, "the OpenAI Responses API").await?;
         let status = response.status();
-        let body = response
-            .text()
-            .await
-            .context("cannot read the OpenAI response")?;
         if !status.is_success() {
+            let body = response
+                .text()
+                .await
+                .context("cannot read the OpenAI response")?;
             bail!("OpenAI API returned {status}: {}", api_error_message(&body));
         }
-        let response: Value =
-            serde_json::from_str(&body).context("OpenAI returned invalid JSON")?;
-        parse_response(&response, &mut self.history)
+
+        // The Responses stream emits incremental `response.output_text.delta`
+        // events plus a terminal `response.completed` event carrying the full
+        // response object, which we parse exactly as in the non-streaming path.
+        let mut completed: Option<Value> = None;
+        super::read_sse(response, |data| {
+            let event: Value =
+                serde_json::from_str(data).context("OpenAI stream returned invalid JSON")?;
+            match event.get("type").and_then(Value::as_str) {
+                Some("response.output_text.delta") => {
+                    if let Some(delta) = event.get("delta").and_then(Value::as_str) {
+                        sink(delta);
+                    }
+                }
+                Some("response.completed") => {
+                    if let Some(response) = event.get("response") {
+                        completed = Some(response.clone());
+                    }
+                }
+                _ => {}
+            }
+            Ok(())
+        })
+        .await?;
+
+        let response =
+            completed.context("OpenAI stream ended without a completed response event")?;
+        let mut turn = parse_response(&response, &mut self.history)?;
+        turn.model = self.model.clone();
+        Ok(turn)
+    }
+}
+
+fn is_user_item(item: &Value) -> bool {
+    item.get("role").and_then(Value::as_str) == Some("user")
+}
+
+fn sanitize_historical_images(history: &mut [Value]) {
+    for item in history {
+        let Some(content) = item.get_mut("content").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for part in content {
+            if part.get("type").and_then(Value::as_str) == Some("input_image")
+                || part.get("image_url").is_some()
+            {
+                *part = json!({"type": "input_text", "text": VISUAL_SANITIZED});
+            }
+        }
     }
 }
 
@@ -119,6 +177,7 @@ fn parse_response(response: &Value, history: &mut Vec<Value>) -> Result<ModelTur
     }
 
     Ok(ModelTurn {
+        model: String::new(),
         response_id: response
             .get("id")
             .and_then(Value::as_str)
@@ -213,13 +272,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn sanitizes_old_images_on_the_next_text_turn() {
+        let mut history = vec![image_message("inspect", "data:image/png;base64,YQ==")];
+        sanitize_historical_images(&mut history);
+        let serialized = serde_json::to_string(&history).unwrap();
+        assert!(!serialized.contains("data:image"));
+        assert!(serialized.contains(VISUAL_SANITIZED));
+    }
+
     #[tokio::test]
     async fn calls_mock_responses_endpoint() {
-        let body = r#"{
-            "id":"resp_mock",
-            "output":[{"type":"message","content":[{"type":"output_text","text":"ok"}]}],
-            "usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}
-        }"#;
+        // Streamed Responses API: a text delta then a completed event.
+        let completed = json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp_mock",
+                "output": [{"type": "message", "content": [
+                    {"type": "output_text", "text": "ok"}
+                ]}],
+                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+            }
+        })
+        .to_string();
+        let body = format!(
+            "data: {}\n\ndata: {completed}\n\ndata: [DONE]\n\n",
+            r#"{"type":"response.output_text.delta","delta":"ok"}"#
+        );
+        let body: &'static str = Box::leak(body.into_boxed_str());
         let (base_url, server) = test_support::mock_http_server(vec![("200 OK", body)]).await;
         let config = Config {
             provider: Provider::OpenAi,
@@ -233,10 +313,17 @@ mod tests {
         };
         let mut provider = OpenAi::new(&config);
         provider.push_user("hello");
-        let turn = provider.create_turn(&reqwest::Client::new()).await.unwrap();
+        let mut streamed = String::new();
+        let mut sink = |delta: &str| streamed.push_str(delta);
+        let turn = provider
+            .create_turn(&reqwest::Client::new(), Vec::new(), &mut sink)
+            .await
+            .unwrap();
         assert_eq!(turn.answer.as_deref(), Some("ok"));
+        assert_eq!(streamed, "ok");
         let requests = server.await.unwrap();
         assert!(requests[0].starts_with("POST /responses "));
         assert!(requests[0].contains("authorization: Bearer test-key"));
+        assert!(requests[0].contains("\"stream\":true"));
     }
 }

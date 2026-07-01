@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
@@ -5,25 +6,61 @@ use anyhow::{Context, Result, bail};
 use walkdir::WalkDir;
 
 const SENSITIVE_COMPONENTS: &[&str] = &[".ssh", ".gnupg", ".aws"];
+const SENSITIVE_FILES: &[&str] = &[
+    ".zshrc",
+    ".bashrc",
+    ".profile",
+    ".env",
+    ".netrc",
+    ".npmrc",
+    ".git-credentials",
+];
 
 pub fn ensure_not_sensitive(path: &Path, home: &Path) -> Result<()> {
+    check_sensitive_path(path, home)?;
+    if let Some(resolved) = resolve_existing_ancestor(path) {
+        let resolved_home = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
+        check_sensitive_path(&resolved, &resolved_home)?;
+    }
+    Ok(())
+}
+
+fn check_sensitive_path(path: &Path, home: &Path) -> Result<()> {
     let relative = path.strip_prefix(home).unwrap_or(path);
-    if relative.components().any(|component| {
-        component
-            .as_os_str()
-            .to_str()
-            .is_some_and(|name| SENSITIVE_COMPONENTS.contains(&name))
-    }) || relative == Path::new(".zshrc")
-        || relative == Path::new(".bashrc")
-        || relative == Path::new(".profile")
-        || relative.starts_with("Library/Keychains")
-    {
+    let components = relative
+        .components()
+        .filter_map(|component| component.as_os_str().to_str())
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>();
+    let sensitive_component = components
+        .iter()
+        .any(|name| SENSITIVE_COMPONENTS.contains(&name.as_str()));
+    let sensitive_file = components
+        .last()
+        .is_some_and(|name| SENSITIVE_FILES.contains(&name.as_str()));
+    let sensitive_library = components.starts_with(&["library".to_owned(), "keychains".to_owned()])
+        || components.starts_with(&["library".to_owned(), "mail".to_owned()]);
+    if sensitive_component || sensitive_file || sensitive_library {
         bail!(
             "access to protected credential/configuration path is blocked: {}",
             path.display()
         );
     }
     Ok(())
+}
+
+fn resolve_existing_ancestor(path: &Path) -> Option<PathBuf> {
+    let mut ancestor = path;
+    let mut suffix = Vec::<OsString>::new();
+    while !ancestor.exists() {
+        suffix.push(ancestor.file_name()?.to_os_string());
+        ancestor = ancestor.parent()?;
+    }
+    let mut resolved = std::fs::canonicalize(ancestor).ok()?;
+    for component in suffix.iter().rev() {
+        resolved.push(component);
+    }
+    Some(resolved)
 }
 
 pub fn resolve_path(raw: &str, home: &Path) -> PathBuf {
@@ -163,17 +200,31 @@ pub async fn read_file(path: &Path, max_bytes: usize) -> Result<String> {
         .await
         .with_context(|| format!("cannot read {}", path.display()))?;
     let truncated = bytes.len() > max_bytes;
-    let slice = &bytes[..bytes.len().min(max_bytes)];
-    let mut text = String::from_utf8_lossy(slice).into_owned();
+    // Back the cut off to a UTF-8 character boundary so lossy decoding does not
+    // split a multi-byte sequence and emit replacement characters at the edge.
+    let mut end = bytes.len().min(max_bytes);
+    while end > 0 && end < bytes.len() && !is_utf8_char_boundary(bytes[end]) {
+        end -= 1;
+    }
+    let mut text = String::from_utf8_lossy(&bytes[..end]).into_owned();
     if truncated {
         text.push_str("\n[truncated]");
     }
     Ok(text)
 }
 
+/// True if `byte` is the start of a UTF-8 code point (or ASCII). Continuation
+/// bytes have the top two bits set to `10`.
+fn is_utf8_char_boundary(byte: u8) -> bool {
+    (byte as i8) >= -0x40
+}
+
 pub async fn write_file(path: &Path, content: &str, overwrite: bool) -> Result<String> {
     if path.exists() && !overwrite {
-        bail!("file exists and overwrite is false: {}", path.display());
+        bail!(
+            "a file already exists at {} and was not replaced because the task did not request overwriting it; if the user asked to replace it, retry with overwrite set to true, otherwise choose a different path",
+            path.display()
+        );
     }
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;
@@ -262,6 +313,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn write_file_reports_actionable_error_for_existing_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("note.txt");
+        write_file(&file, "first", false).await.unwrap();
+
+        let error = write_file(&file, "second", false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("already exists"));
+        assert!(error.contains("overwrite set to true"));
+        // The original content must be untouched by a refused write.
+        assert_eq!(read_file(&file, 100).await.unwrap(), "first");
+
+        // With overwrite the write proceeds.
+        write_file(&file, "second", true).await.unwrap();
+        assert_eq!(read_file(&file, 100).await.unwrap(), "second");
+    }
+
+    #[tokio::test]
     async fn finds_named_items() {
         let temp = tempfile::tempdir().unwrap();
         let target = temp.path().join("Reports");
@@ -304,5 +375,29 @@ mod tests {
             ensure_not_sensitive(&home.join("Library/Keychains/login.keychain-db"), home).is_err()
         );
         assert!(ensure_not_sensitive(&home.join("Documents/report.txt"), home).is_ok());
+    }
+
+    #[tokio::test]
+    async fn truncates_on_a_utf8_char_boundary() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("multibyte.txt");
+        // "é" is two bytes (0xC3 0xA9); cutting at 1 byte would split it.
+        tokio::fs::write(&file, "aé".as_bytes()).await.unwrap();
+
+        let result = read_file(&file, 2).await.unwrap();
+        // The cut backs off to before "é", so no replacement char appears.
+        assert!(result.starts_with('a'));
+        assert!(!result.contains('\u{fffd}'));
+        assert!(result.contains("[truncated]"));
+
+        // Reading with enough budget returns the whole string intact.
+        assert!(read_file(&file, 100).await.unwrap().starts_with("aé"));
+    }
+
+    #[test]
+    fn identifies_utf8_char_boundaries() {
+        assert!(is_utf8_char_boundary(b'a'));
+        assert!(is_utf8_char_boundary(0xC3)); // leading byte
+        assert!(!is_utf8_char_boundary(0xA9)); // continuation byte
     }
 }

@@ -3,6 +3,7 @@ mod openrouter;
 
 use anyhow::Result;
 use anyhow::{Context, bail};
+use futures_util::StreamExt;
 use reqwest::{RequestBuilder, Response, StatusCode};
 use serde_json::Value;
 use tokio::time::{Duration, sleep};
@@ -11,6 +12,39 @@ use crate::config::{Config, Provider};
 
 pub use openai::OpenAi;
 pub use openrouter::OpenRouter;
+
+/// Receives assistant text deltas as they stream in. Tool-call deltas are not
+/// forwarded here; only user-visible answer text is.
+pub type TextSink<'a> = &'a mut (dyn FnMut(&str) + Send);
+
+/// Reads a streamed SSE response, invoking `on_event` for each `data:` payload
+/// (excluding the terminal `[DONE]`). Returns once the stream ends.
+pub(super) async fn read_sse(
+    response: Response,
+    mut on_event: impl FnMut(&str) -> Result<()>,
+) -> Result<()> {
+    let mut stream = response.bytes_stream();
+    let mut buffer = String::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.context("cannot read a streamed response chunk")?;
+        buffer.push_str(&String::from_utf8_lossy(&chunk));
+        // SSE events are separated by a blank line; fields we care about are
+        // `data:` lines. Process complete lines and keep any partial tail.
+        while let Some(newline) = buffer.find('\n') {
+            let line = buffer[..newline].trim_end_matches('\r').to_owned();
+            buffer.drain(..=newline);
+            let Some(data) = line.strip_prefix("data:") else {
+                continue;
+            };
+            let data = data.trim();
+            if data.is_empty() || data == "[DONE]" {
+                continue;
+            }
+            on_event(data)?;
+        }
+    }
+    Ok(())
+}
 
 #[derive(Clone, Debug)]
 pub struct ToolCall {
@@ -21,6 +55,7 @@ pub struct ToolCall {
 
 #[derive(Clone, Debug)]
 pub struct ModelTurn {
+    pub model: String,
     pub response_id: String,
     pub usage: Usage,
     pub tool_calls: Vec<ToolCall>,
@@ -73,6 +108,31 @@ fn retry_delay(attempt: usize) -> Duration {
     Duration::from_millis(500 * (1_u64 << attempt))
 }
 
+/// Maximum number of history items retained by either provider before
+/// compaction. Kept here so both wire-format implementations agree.
+pub(super) const MAX_HISTORY_ITEMS: usize = 128;
+
+/// Drops the oldest history items when the log grows past `MAX_HISTORY_ITEMS`,
+/// always trimming to a boundary where the retained window starts at a user
+/// item. `is_user` identifies user items in each provider's own format.
+///
+/// If no user boundary is found in the trimmable window the history is left
+/// unchanged, which is safe: the cap is a soft budget, not a hard invariant.
+pub(super) fn compact_history<T>(history: &mut Vec<T>, is_user: impl Fn(&T) -> bool) {
+    if history.len() <= MAX_HISTORY_ITEMS {
+        return;
+    }
+    let target = history.len().saturating_sub(MAX_HISTORY_ITEMS);
+    let split = history
+        .iter()
+        .enumerate()
+        .skip(target)
+        .find_map(|(index, item)| is_user(item).then_some(index));
+    if let Some(split) = split {
+        history.drain(..split);
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod test_support {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -101,9 +161,47 @@ pub(crate) mod test_support {
         });
         (format!("http://{address}"), server)
     }
+
+    /// Wraps Chat Completions SSE `data:` events into a `'static` body ending
+    /// with `[DONE]`, suitable for the mock server.
+    pub fn sse_body(events: &[serde_json::Value]) -> &'static str {
+        let mut body = String::new();
+        for event in events {
+            body.push_str(&format!("data: {event}\n\n"));
+        }
+        body.push_str("data: [DONE]\n\n");
+        Box::leak(body.into_boxed_str())
+    }
+
+    /// A single-chunk Chat Completions text answer stream.
+    pub fn sse_text(id: &str, content: &str) -> &'static str {
+        sse_body(&[
+            serde_json::json!({"id": id, "choices": [{"delta": {"content": content}}]}),
+            serde_json::json!({
+                "id": id,
+                "choices": [{"delta": {}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            }),
+        ])
+    }
+
+    /// Wraps a complete OpenAI Responses `response` object as a streamed
+    /// `response.completed` event (plus [DONE]).
+    pub fn sse_openai(response: serde_json::Value) -> &'static str {
+        let event = serde_json::json!({"type": "response.completed", "response": response});
+        let body = format!("data: {event}\n\ndata: [DONE]\n\n");
+        Box::leak(body.into_boxed_str())
+    }
 }
 
 impl Backend {
+    pub fn checkpoint(&self) -> Self {
+        match self {
+            Self::OpenAi(provider) => Self::OpenAi(provider.clone()),
+            Self::OpenRouter(provider) => Self::OpenRouter(provider.fork()),
+        }
+    }
+
     pub fn new(config: &Config) -> Self {
         match config.provider {
             Provider::OpenAi => Self::OpenAi(OpenAi::new(config)),
@@ -139,10 +237,15 @@ impl Backend {
         }
     }
 
-    pub async fn create_turn(&mut self, client: &reqwest::Client) -> Result<ModelTurn> {
+    pub async fn create_turn(
+        &mut self,
+        client: &reqwest::Client,
+        tools: Vec<Value>,
+        sink: TextSink<'_>,
+    ) -> Result<ModelTurn> {
         match self {
-            Self::OpenAi(provider) => provider.create_turn(client).await,
-            Self::OpenRouter(provider) => provider.create_turn(client).await,
+            Self::OpenAi(provider) => provider.create_turn(client, tools, sink).await,
+            Self::OpenRouter(provider) => provider.create_turn(client, tools, sink).await,
         }
     }
 }

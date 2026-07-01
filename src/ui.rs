@@ -1,5 +1,12 @@
 use std::env;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
+
+use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
+use tokio::time::{Duration, sleep};
 
 use crate::agent::{TaskResult, Usage};
 use crate::config::{Config, ModelOption, Provider};
@@ -10,6 +17,122 @@ const GREEN: &str = "\x1b[32m";
 const DIM: &str = "\x1b[2m";
 const BOLD: &str = "\x1b[1m";
 const RESET: &str = "\x1b[0m";
+const BLUE: &str = "\x1b[38;5;39m";
+const YELLOW: &str = "\x1b[38;5;179m";
+const RED: &str = "\x1b[38;5;203m";
+const GREY: &str = "\x1b[38;5;245m";
+
+const RULE_WIDTH: usize = 64;
+
+const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// Animated single-line activity indicator shown while Finn waits on the model
+/// or runs a tool. Renders to stdout only when stdout is a terminal; otherwise
+/// it is inert so piped/redirected output stays clean.
+pub struct Spinner {
+    label: Arc<Mutex<String>>,
+    stop: Arc<AtomicBool>,
+    suppressed: Arc<AtomicBool>,
+    task: Option<JoinHandle<()>>,
+}
+
+impl Spinner {
+    /// Starts a spinner with an initial `label`. On a non-terminal stdout the
+    /// spinner does nothing, so callers can use it unconditionally.
+    pub fn start(label: impl Into<String>) -> Self {
+        let label = Arc::new(Mutex::new(label.into()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let suppressed = Arc::new(AtomicBool::new(false));
+        if !io::stdout().is_terminal() || !color_enabled() {
+            return Self {
+                label,
+                stop,
+                suppressed,
+                task: None,
+            };
+        }
+        let task_label = Arc::clone(&label);
+        let task_stop = Arc::clone(&stop);
+        let task_suppressed = Arc::clone(&suppressed);
+        let task = tokio::spawn(async move {
+            let started = Instant::now();
+            let mut frame = 0_usize;
+            let mut cleared = false;
+            while !task_stop.load(Ordering::Relaxed) {
+                // When suppressed (e.g. the answer is streaming), clear the line
+                // once and stop drawing, but keep the task alive so stop() joins.
+                if task_suppressed.load(Ordering::Relaxed) {
+                    if !cleared {
+                        let mut out = io::stdout().lock();
+                        let _ = write!(out, "\r\x1b[2K");
+                        let _ = out.flush();
+                        cleared = true;
+                    }
+                    sleep(Duration::from_millis(50)).await;
+                    continue;
+                }
+                cleared = false;
+                let text = task_label.lock().await.clone();
+                let glyph = SPINNER_FRAMES[frame % SPINNER_FRAMES.len()];
+                let elapsed = started.elapsed().as_secs_f64();
+                {
+                    let mut out = io::stdout().lock();
+                    let _ = write!(
+                        out,
+                        "\r\x1b[2K{BLUE}{glyph}{RESET} {text} {DIM}{elapsed:.1}s{RESET}"
+                    );
+                    let _ = out.flush();
+                }
+                frame += 1;
+                sleep(Duration::from_millis(90)).await;
+            }
+        });
+        Self {
+            label,
+            stop,
+            suppressed,
+            task: Some(task),
+        }
+    }
+
+    /// Returns the flag the animation checks to suppress drawing. Flipping it to
+    /// `true` lets a synchronous streaming sink take over the line safely.
+    pub fn suppressor(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.suppressed)
+    }
+
+    /// Re-enables animation after a suppressed stretch.
+    pub fn resume(&self) {
+        self.suppressed.store(false, Ordering::Relaxed);
+    }
+
+    /// Replaces the activity label shown next to the spinner.
+    pub async fn set_label(&self, label: impl Into<String>) {
+        *self.label.lock().await = label.into();
+    }
+
+    /// Clears the current spinner line so the caller can print a durable line
+    /// without the animation overwriting it. The animation, if running, redraws
+    /// on its next frame below the printed output.
+    pub async fn pause_line(&self) {
+        if self.task.is_some() {
+            let mut out = io::stdout().lock();
+            let _ = write!(out, "\r\x1b[2K");
+            let _ = out.flush();
+        }
+    }
+
+    /// Stops the animation and clears the spinner line.
+    pub async fn stop(mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(task) = self.task.take() {
+            let _ = task.await;
+            let mut out = io::stdout().lock();
+            let _ = write!(out, "\r\x1b[2K");
+            let _ = out.flush();
+        }
+    }
+}
 
 pub struct CommandSpec {
     pub name: &'static str,
@@ -44,64 +167,132 @@ pub const COMMANDS: &[CommandSpec] = &[
 ];
 
 pub fn render_startup(config: &Config, tool_count: usize) {
-    let line = "-".repeat(72);
-    println!("{}", style(&line, DIM));
-    println!(
-        "{} {}",
-        style("FinnAgent", BOLD),
-        style(&format!("v{VERSION}"), DIM)
-    );
-    println!(
-        "{}  {}  {}  {}",
-        field("model", &config.model),
-        field("reasoning", &config.reasoning_effort),
-        field("tools", &tool_count.to_string()),
-        field("mode", "direct")
-    );
-    println!(
-        "{}  {}",
-        field("api", config.provider.api_label()),
-        field("session tokens", "0")
-    );
+    // Each content line is a (plain, colored) pair. The plain text is measured
+    // to size the box so nothing overflows the border; the colored text is what
+    // gets printed.
+    let mut lines: Vec<(String, String)> = vec![
+        (
+            format!("Finn v{VERSION}  ·  natural-language macOS assistant"),
+            format!(
+                "{} {}",
+                style("Finn", &format!("{BOLD}{BLUE}")),
+                style(
+                    &format!("v{VERSION}  ·  natural-language macOS assistant"),
+                    DIM
+                )
+            ),
+        ),
+        (
+            format!(
+                "model {}  reasoning {}  tools {}  api {}",
+                config.model,
+                config.reasoning_effort,
+                tool_count,
+                config.provider.api_label()
+            ),
+            format!(
+                "{}  {}  {}  {}",
+                field("model", &config.model),
+                field("reasoning", &config.reasoning_effort),
+                field("tools", &tool_count.to_string()),
+                field("api", config.provider.api_label())
+            ),
+        ),
+    ];
     if let Some(vision_model) = &config.vision_model {
-        println!("{}", field("future vision model", vision_model));
+        lines.push((
+            format!("vision route {vision_model}"),
+            field("vision route", vision_model),
+        ));
     }
-    println!("{}", style(&line, DIM));
-    println!("Tell Finn what to do. Questions remain read-only; tasks execute immediately.");
-    println!("Type / then Tab for commands, or /commands for the full list.");
-    println!("Use Up/Down for history, Left/Right to edit, Ctrl-C to exit.");
+
+    // Inner width = widest plain line, with two spaces of padding on each side.
+    let inner = lines
+        .iter()
+        .map(|(plain, _)| plain.chars().count())
+        .max()
+        .unwrap_or(0)
+        + 4;
+
+    println!("{}", style(&format!("╭{}╮", "─".repeat(inner)), BLUE));
+    for (plain, colored) in &lines {
+        let pad = inner.saturating_sub(plain.chars().count() + 2);
+        println!(
+            "{}  {}{}{}",
+            style("│", BLUE),
+            colored,
+            " ".repeat(pad),
+            style("│", BLUE)
+        );
+    }
+    println!("{}", style(&format!("╰{}╯", "─".repeat(inner)), BLUE));
+    println!(
+        "{}",
+        style(
+            "Tell Finn what to do. Questions stay read-only; tasks run immediately.",
+            DIM
+        )
+    );
+    println!(
+        "{}",
+        style(
+            "Type / then Tab for commands  ·  Up/Down for history  ·  Ctrl-C to exit.",
+            DIM
+        )
+    );
     println!();
 }
 
 pub fn render_commands() {
-    println!("Available commands:");
+    println!("{}", style("Commands", &format!("{BOLD}{BLUE}")));
     for command in COMMANDS {
-        println!("  {:<10} {}", command.name, command.description);
+        println!(
+            "  {}  {}",
+            style(&format!("{:<10}", command.name), CYAN),
+            style(command.description, DIM)
+        );
     }
     println!();
-    println!("Everything else is treated as a natural-language task.");
-    println!("Paste or drag an image path to send the image to the active model.");
+    println!(
+        "{}",
+        style(
+            "Everything else is a natural-language task. Paste or drag an image path to send it.",
+            DIM
+        )
+    );
     println!();
 }
 
 pub fn render_models(active_provider: Provider, active_model: &str, models: &[ModelOption]) {
-    println!("Available models:");
+    println!("{}", style("Available models", &format!("{BOLD}{BLUE}")));
     for (index, model) in models.iter().enumerate() {
-        let active = if model.provider == active_provider && model.id == active_model {
-            " (active)"
+        let is_active = model.provider == active_provider && model.id == active_model;
+        let marker = if is_active {
+            style("●", GREEN)
         } else {
-            ""
+            style("·", DIM)
+        };
+        let id = if is_active {
+            style(&model.id, BOLD)
+        } else {
+            model.id.clone()
         };
         println!(
-            "  {}. {}  [{}]{}",
+            "  {} {:>2}. {}  {}",
+            marker,
             index + 1,
-            model.id,
-            model.provider,
-            active
+            id,
+            style(&format!("[{}]", model.provider), DIM)
         );
     }
     println!();
-    println!("Enter a number or an exact custom model ID. Press Enter to cancel.");
+    println!(
+        "{}",
+        style(
+            "Enter a number or an exact custom model ID. Press Enter to cancel.",
+            DIM
+        )
+    );
 }
 
 pub fn resolve_model_selection(
@@ -127,51 +318,93 @@ pub fn clear_screen() {
     let _ = io::stdout().flush();
 }
 
-pub fn render_tool_call(index: u64, name: &str) {
+/// Builds a readline prompt string. ANSI codes are wrapped in the `\x01`/`\x02`
+/// markers rustyline uses to exclude non-printing bytes from width counting.
+pub fn prompt(label: &str) -> String {
+    if color_enabled() {
+        format!("\x01{CYAN}\x02{label} ›\x01{RESET}\x02 ")
+    } else {
+        format!("{label} > ")
+    }
+}
+
+pub fn render_tool_call(index: u64, name: &str, status: &str) {
+    let (glyph, glyph_color) = match status {
+        "complete" => ("✔", GREEN),
+        "denied" => ("⊘", YELLOW),
+        _ => ("✗", RED),
+    };
     println!(
-        "{} {}",
-        style(&format!("[tool {index}]"), CYAN),
-        tool_label(name)
+        "  {} {} {}{}",
+        style(glyph, glyph_color),
+        style(&tool_label(name), BOLD),
+        style(&format!("#{index}"), DIM),
+        if status == "complete" {
+            String::new()
+        } else {
+            style(&format!("  {status}"), glyph_color)
+        }
     );
 }
 
-pub fn render_task_result(result: &TaskResult, model: &str, reasoning: &str) {
-    println!();
-    println!("{} {}", style("Finn", GREEN), result.answer);
-    println!();
-    let line = "-".repeat(72);
-    println!("{}", style(&line, DIM));
+/// The header line printed above Finn's answer, e.g. `● Finn`.
+pub fn answer_header() -> String {
+    format!(
+        "{} {}",
+        style("●", GREEN),
+        style("Finn", &format!("{BOLD}{GREEN}"))
+    )
+}
+
+pub fn render_task_result(result: &TaskResult, reasoning: &str) {
+    // When the answer was streamed live, its body and header are already on
+    // screen; only add spacing and the summary. Otherwise print the header and
+    // the markdown-rendered answer here.
+    if result.answer_streamed {
+        println!();
+    } else {
+        println!();
+        println!("{}", answer_header());
+        println!(
+            "{}",
+            crate::markdown::render(&result.answer, color_enabled())
+        );
+        println!();
+    }
+
+    let rule = "─".repeat(RULE_WIDTH);
+    println!("{}", style(&rule, GREY));
     println!(
-        "{}  {}  {}  {}",
+        "  {}   {}   {}   {}",
         field("turn", &result.turn.to_string()),
-        field("model", model),
+        field("model", &result.model),
         field("reasoning", reasoning),
         field("tools", &result.tool_calls.to_string())
     );
     println!(
-        "{}  {}  {}  {}",
-        field("task tokens", &format_usage(result.task_usage)),
+        "  {}   {}   {}",
+        field("tokens", &format_usage(result.task_usage)),
         field("session", &format_number(result.session_usage.total_tokens)),
-        field("API rounds", &result.api_rounds.to_string()),
-        field("elapsed", &format_duration(result.elapsed_ms))
+        field("rounds", &result.api_rounds.to_string())
     );
-    if result.task_usage.cached_input_tokens > 0 || result.task_usage.reasoning_tokens > 0 {
-        println!(
-            "{}  {}",
-            field(
-                "cached input",
-                &format_number(result.task_usage.cached_input_tokens)
-            ),
-            field(
-                "reasoning tokens",
-                &format_number(result.task_usage.reasoning_tokens)
-            )
-        );
+    let mut extras = vec![field("elapsed", &format_duration(result.elapsed_ms))];
+    if result.task_usage.cached_input_tokens > 0 {
+        extras.push(field(
+            "cached",
+            &format_number(result.task_usage.cached_input_tokens),
+        ));
+    }
+    if result.task_usage.reasoning_tokens > 0 {
+        extras.push(field(
+            "reasoning tokens",
+            &format_number(result.task_usage.reasoning_tokens),
+        ));
     }
     if !result.response_id.is_empty() {
-        println!("{}", field("response", &short_id(&result.response_id)));
+        extras.push(field("response", &short_id(&result.response_id)));
     }
-    println!("{}", style(&line, DIM));
+    println!("  {}", extras.join("   "));
+    println!("{}", style(&rule, GREY));
     println!();
 }
 
@@ -185,10 +418,10 @@ fn format_usage(usage: Usage) -> String {
 }
 
 fn field(name: &str, value: &str) -> String {
-    format!("{} {}", style(name, DIM), value)
+    format!("{} {}", style(name, GREY), style(value, BOLD))
 }
 
-fn tool_label(name: &str) -> String {
+pub fn tool_label(name: &str) -> String {
     name.replace('_', " ")
 }
 
@@ -236,6 +469,17 @@ fn color_enabled() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn spinner_lifecycle_is_safe_without_a_terminal() {
+        // In the test harness stdout is not a terminal, so the spinner is
+        // inert. Starting, relabeling, pausing, and stopping must not panic and
+        // must leave no background task running.
+        let spinner = Spinner::start("Thinking");
+        spinner.set_label("Running path status").await;
+        spinner.pause_line().await;
+        spinner.stop().await;
+    }
 
     #[test]
     fn formats_token_counts() {

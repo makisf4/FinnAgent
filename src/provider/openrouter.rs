@@ -1,110 +1,81 @@
 use anyhow::{Context, Result, bail};
 use serde_json::{Map, Value, json};
 
-use super::{ModelTurn, ToolCall, Usage, api_error_message, send_with_retry};
+use super::{ModelTurn, ToolCall, Usage};
 use crate::config::Config;
-use crate::tools;
+use crate::orchestrator::{FinnOrchestrator, OrchestratorConfig};
 
 #[derive(Clone)]
 pub struct OpenRouter {
-    api_key: String,
-    base_url: String,
-    model: String,
+    orchestrator: FinnOrchestrator,
     reasoning_effort: String,
-    messages: Vec<Value>,
 }
 
 impl OpenRouter {
     pub fn new(config: &Config) -> Self {
+        let tier2_model = config
+            .vision_model
+            .clone()
+            .unwrap_or_else(|| config.model.clone());
         Self {
-            api_key: config.api_key.clone(),
-            base_url: config.base_url.trim_end_matches('/').to_owned(),
-            model: config.model.clone(),
+            orchestrator: FinnOrchestrator::new(OrchestratorConfig {
+                api_key: config.api_key.clone(),
+                base_url: config.base_url.clone(),
+                tier1_model: config.model.clone(),
+                tier2_model,
+                reasoning_effort: config.reasoning_effort.clone(),
+            }),
             reasoning_effort: config.reasoning_effort.clone(),
-            messages: Vec::new(),
         }
     }
 
     pub fn push_user(&mut self, task: &str) {
-        self.messages.push(json!({"role": "user", "content": task}));
+        self.orchestrator.push_user(task);
     }
 
     pub fn push_user_image(&mut self, prompt: &str, data_url: &str) {
-        self.messages.push(image_message(prompt, data_url));
+        self.orchestrator.push_user_image(prompt, data_url);
     }
 
     pub fn push_assistant(&mut self, answer: &str) {
-        self.messages
-            .push(json!({"role": "assistant", "content": answer}));
+        self.orchestrator.push_assistant(answer);
     }
 
     pub fn push_tool_result(&mut self, call_id: &str, result: &str) {
-        self.messages.push(json!({
-            "role": "tool",
-            "tool_call_id": call_id,
-            "content": result,
-        }));
+        self.orchestrator.push_tool_result(call_id, result);
     }
 
-    pub async fn create_turn(&mut self, client: &reqwest::Client) -> Result<ModelTurn> {
-        let request = build_request(
-            &self.model,
-            &crate::agent::instructions(&self.model, &self.reasoning_effort),
-            &self.messages,
-        );
-        let request = client
-            .post(format!("{}/chat/completions", self.base_url))
-            .bearer_auth(&self.api_key)
-            .json(&request);
-        let response = send_with_retry(request, "the OpenRouter Chat Completions API").await?;
-        let status = response.status();
-        let body = response
-            .text()
-            .await
-            .context("cannot read the OpenRouter response")?;
-        if !status.is_success() {
-            bail!(
-                "OpenRouter API returned {status}: {}",
-                api_error_message(&body)
-            );
+    pub fn fork(&self) -> Self {
+        Self {
+            orchestrator: self.orchestrator.fork(),
+            reasoning_effort: self.reasoning_effort.clone(),
         }
-        let response: Value =
-            serde_json::from_str(&body).context("OpenRouter returned invalid JSON")?;
-        let turn = parse_response(&response)?;
-        let assistant = response
-            .pointer("/choices/0/message")
-            .cloned()
-            .context("OpenRouter response did not contain choices[0].message")?;
-        self.messages.push(assistant);
+    }
+
+    pub async fn create_turn(
+        &mut self,
+        client: &reqwest::Client,
+        tools: Vec<Value>,
+        sink: super::TextSink<'_>,
+    ) -> Result<ModelTurn> {
+        let reasoning_effort = self.reasoning_effort.clone();
+        let response = self
+            .orchestrator
+            .create_turn(
+                client,
+                |model| crate::agent::instructions(model, &reasoning_effort),
+                chat_tool_definitions(tools),
+                sink,
+            )
+            .await?;
+        let mut turn = parse_response(&response.response)?;
+        turn.model = response.model;
         Ok(turn)
     }
 }
 
-fn image_message(prompt: &str, data_url: &str) -> Value {
-    json!({
-        "role": "user",
-        "content": [
-            {"type": "text", "text": prompt},
-            {"type": "image_url", "image_url": {"url": data_url}}
-        ]
-    })
-}
-
-fn build_request(model: &str, instructions: &str, history: &[Value]) -> Value {
-    let mut messages = Vec::with_capacity(history.len() + 1);
-    messages.push(json!({"role": "system", "content": instructions}));
-    messages.extend_from_slice(history);
-    json!({
-        "model": model,
-        "messages": messages,
-        "tools": chat_tool_definitions(),
-        "tool_choice": "auto",
-        "parallel_tool_calls": false,
-    })
-}
-
-fn chat_tool_definitions() -> Vec<Value> {
-    tools::definitions()
+fn chat_tool_definitions(tools: Vec<Value>) -> Vec<Value> {
+    tools
         .into_iter()
         .map(|tool| {
             let object = tool.as_object().expect("tool definitions are objects");
@@ -140,6 +111,7 @@ fn parse_response(response: &Value) -> Result<ModelTurn> {
     let usage = response.get("usage").unwrap_or(&Value::Null);
 
     Ok(ModelTurn {
+        model: String::new(),
         response_id: response
             .get("id")
             .and_then(Value::as_str)
@@ -198,32 +170,6 @@ mod tests {
     use crate::provider::test_support;
 
     #[test]
-    fn serializes_chat_completions_request() {
-        let request = build_request(
-            "z-ai/glm-5.2",
-            "System instructions",
-            &[json!({"role": "user", "content": "List files"})],
-        );
-        assert_eq!(request["model"], "z-ai/glm-5.2");
-        assert_eq!(request["messages"][0]["role"], "system");
-        assert_eq!(request["messages"][1]["role"], "user");
-        assert_eq!(request["tools"][0]["type"], "function");
-        assert!(request["tools"][0].get("name").is_none());
-        assert_eq!(request["tools"][0]["function"]["name"], "path_status");
-    }
-
-    #[test]
-    fn serializes_chat_completions_image_input() {
-        let message = image_message("What is this?", "data:image/png;base64,YQ==");
-        assert_eq!(message["content"][0]["type"], "text");
-        assert_eq!(message["content"][1]["type"], "image_url");
-        assert_eq!(
-            message["content"][1]["image_url"]["url"],
-            "data:image/png;base64,YQ=="
-        );
-    }
-
-    #[test]
     fn parses_tool_call_response() {
         let response = json!({
             "id": "gen-1",
@@ -246,6 +192,7 @@ mod tests {
         assert_eq!(turn.tool_calls[0].id, "call_1");
         assert_eq!(turn.tool_calls[0].name, "path_status");
         assert_eq!(turn.usage.total_tokens, 15);
+        assert!(turn.model.is_empty());
     }
 
     #[test]
@@ -262,11 +209,7 @@ mod tests {
 
     #[tokio::test]
     async fn calls_mock_chat_completions_endpoint() {
-        let body = r#"{
-            "id":"gen_mock",
-            "choices":[{"message":{"role":"assistant","content":"ok"}}],
-            "usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}
-        }"#;
+        let body = test_support::sse_text("gen_mock", "ok");
         let (base_url, server) = test_support::mock_http_server(vec![("200 OK", body)]).await;
         let config = Config {
             provider: Provider::OpenRouter,
@@ -280,10 +223,18 @@ mod tests {
         };
         let mut provider = OpenRouter::new(&config);
         provider.push_user("hello");
-        let turn = provider.create_turn(&reqwest::Client::new()).await.unwrap();
+        let mut streamed = String::new();
+        let mut sink = |delta: &str| streamed.push_str(delta);
+        let turn = provider
+            .create_turn(&reqwest::Client::new(), Vec::new(), &mut sink)
+            .await
+            .unwrap();
         assert_eq!(turn.answer.as_deref(), Some("ok"));
+        assert_eq!(turn.model, "router/test");
+        assert_eq!(streamed, "ok");
         let requests = server.await.unwrap();
         assert!(requests[0].starts_with("POST /chat/completions "));
         assert!(requests[0].contains("authorization: Bearer test-key"));
+        assert!(requests[0].contains("\"stream\":true"));
     }
 }

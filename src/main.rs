@@ -2,6 +2,8 @@ mod agent;
 mod catalog;
 mod config;
 mod input;
+mod markdown;
+mod orchestrator;
 mod prompt;
 mod provider;
 mod safety;
@@ -46,9 +48,19 @@ async fn run() -> Result<()> {
             "missing"
         };
         println!("Finn check:");
+        println!("version: {}", env!("CARGO_PKG_VERSION"));
         println!("provider: {provider}");
         println!("model: {model}");
         println!("reasoning: {reasoning}");
+        println!("tools: {}", tools::definitions().len());
+        println!(
+            "shell: {}",
+            if tools::shell_enabled() {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        );
         println!("{key_name}: {key_status}");
         return Ok(());
     }
@@ -56,12 +68,33 @@ async fn run() -> Result<()> {
     let mut config = Config::load()?;
     tokio::fs::create_dir_all(&config.data_dir).await?;
 
-    let context = ToolContext::new(config.home.clone(), config.data_dir.clone());
+    // One-shot and image tasks have no interactive terminal to answer a
+    // confirmation, so high-impact actions auto-deny there. The interactive
+    // REPL prompts the user instead.
+    let confirmer = if args.is_empty() {
+        tools::Confirmer::interactive()
+    } else {
+        tools::Confirmer::auto_deny()
+    };
+    let context = ToolContext::new(config.home.clone(), config.data_dir.clone(), confirmer);
     let mut agent = Agent::new(config.clone(), context)?;
 
     if !args.is_empty() {
-        let result = agent.run_task(&args.join(" ")).await?;
-        ui::render_task_result(&result, &config.model, &config.reasoning_effort);
+        let task = args.join(" ");
+        let result = if let Some(path) = input::pasted_image_path(&task).await {
+            let data_url = input::image_data_url(&path).await?;
+            let log_task = format!("[image: {}]", path.display());
+            agent
+                .run_image_task(
+                    "Analyze this image. Describe what you see and respond helpfully.",
+                    &data_url,
+                    &log_task,
+                )
+                .await?
+        } else {
+            agent.run_task(&task).await?
+        };
+        ui::render_task_result(&result, &config.reasoning_effort);
         return Ok(());
     }
 
@@ -76,7 +109,7 @@ async fn run() -> Result<()> {
     editor.set_helper(Some(SlashHelper));
 
     loop {
-        let line = match editor.readline("finn > ") {
+        let line = match editor.readline(&ui::prompt("finn")) {
             Ok(line) => line,
             Err(ReadlineError::Interrupted | ReadlineError::Eof) => break,
             Err(error) => return Err(error.into()),
@@ -86,27 +119,6 @@ async fn run() -> Result<()> {
             continue;
         }
         if let Some(path) = input::pasted_image_path(task).await {
-            let previous_config = config.clone();
-            let routed_to_vision = config
-                .vision_model
-                .clone()
-                .filter(|vision_model| vision_model != &config.model);
-            if let Some(vision_model) = &routed_to_vision {
-                match config.switched(config.provider, vision_model) {
-                    Ok(vision_config) => {
-                        println!(
-                            "Image route: {} [{}]",
-                            vision_config.model, vision_config.provider
-                        );
-                        agent.switch_model(vision_config.clone());
-                        config = vision_config;
-                    }
-                    Err(error) => {
-                        eprintln!("Cannot select image model {vision_model}: {error:#}");
-                        continue;
-                    }
-                }
-            }
             let data_url = match input::image_data_url(&path).await {
                 Ok(data_url) => data_url,
                 Err(error) => {
@@ -117,18 +129,8 @@ async fn run() -> Result<()> {
             let prompt = "Analyze this image. Describe what you see and respond helpfully.";
             let log_task = format!("[image: {}]", path.display());
             match agent.run_image_task(prompt, &data_url, &log_task).await {
-                Ok(result) => {
-                    ui::render_task_result(&result, &config.model, &config.reasoning_effort)
-                }
+                Ok(result) => ui::render_task_result(&result, &config.reasoning_effort),
                 Err(error) => eprintln!("Image task failed: {error:#}"),
-            }
-            if routed_to_vision.is_some() {
-                agent.switch_model(previous_config.clone());
-                config = previous_config;
-                println!(
-                    "Active model restored: {} [{}]",
-                    config.model, config.provider
-                );
             }
             continue;
         }
@@ -142,7 +144,7 @@ async fn run() -> Result<()> {
                         eprintln!("Model catalog warning: {warning}");
                     }
                     ui::render_models(config.provider, &config.model, &catalog.models);
-                    let selection = match editor.readline("model > ") {
+                    let selection = match editor.readline(&ui::prompt("model")) {
                         Ok(selection) => selection,
                         Err(ReadlineError::Interrupted | ReadlineError::Eof) => continue,
                         Err(error) => return Err(error.into()),
@@ -151,9 +153,16 @@ async fn run() -> Result<()> {
                     {
                         Ok(Some((provider, model))) => match config.switched(provider, &model) {
                             Ok(selected_config) => {
-                                agent.switch_model(selected_config.clone());
+                                let preserved_turns = agent.switch_model(selected_config.clone());
                                 config = selected_config;
                                 println!("Active model: {} [{}]", config.model, config.provider);
+                                if preserved_turns == 0 {
+                                    println!("Starting a fresh conversation on the new model.");
+                                } else {
+                                    println!(
+                                        "Replayed {preserved_turns} text turn(s) onto the new model. Tool results and image inputs from the previous model are not carried over."
+                                    );
+                                }
                             }
                             Err(error) => eprintln!("Cannot select {model}: {error:#}"),
                         },
@@ -172,7 +181,7 @@ async fn run() -> Result<()> {
         editor.add_history_entry(task)?;
 
         match agent.run_task(task).await {
-            Ok(result) => ui::render_task_result(&result, &config.model, &config.reasoning_effort),
+            Ok(result) => ui::render_task_result(&result, &config.reasoning_effort),
             Err(error) => eprintln!("Task failed: {error:#}"),
         }
     }

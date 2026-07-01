@@ -1,3 +1,4 @@
+use std::env;
 use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
@@ -9,6 +10,16 @@ use tokio::time::timeout;
 use crate::safety;
 
 const MAX_OUTPUT_BYTES: usize = 64 * 1024;
+const SAFE_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
+
+pub fn enabled() -> bool {
+    env::var("FINN_ENABLE_SHELL").is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
 
 pub async fn run(command: &str, cwd: &Path, timeout_seconds: u64) -> Result<String> {
     safety::validate_shell(command)?;
@@ -16,9 +27,16 @@ pub async fn run(command: &str, cwd: &Path, timeout_seconds: u64) -> Result<Stri
 
     let mut process = Command::new("/bin/zsh");
     process
-        .arg("-lc")
+        // `-f` prevents shell startup files from restoring secrets after env_clear.
+        .arg("-f")
+        .arg("-c")
         .arg(command)
         .current_dir(cwd)
+        .env_clear()
+        .env("HOME", cwd)
+        .env("PATH", SAFE_PATH)
+        .env("SHELL", "/bin/zsh")
+        .env("LANG", "C.UTF-8")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -80,5 +98,18 @@ mod tests {
     async fn blocks_catastrophic_shell_scripts() {
         let temp = tempfile::tempdir().unwrap();
         assert!(run("rm -rf /", temp.path(), 10).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn child_shell_does_not_inherit_provider_secrets() {
+        let temp = tempfile::tempdir().unwrap();
+        let result = run(
+            "test -z \"$OPENAI_API_KEY\" && test -z \"$OPENROUTER_API_KEY\"",
+            temp.path(),
+            10,
+        )
+        .await
+        .unwrap();
+        assert!(result.contains("exit_code: 0"));
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "finn-agent"
-version = "0.1.0"
+version = "0.4.0"
 edition = "2024"
 description = "A natural-language macOS assistant with OpenAI and OpenRouter providers"
 license = "MIT"
@@ -12,11 +12,18 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 base64 = "0.22"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+docx-rs = "0.4.20"
+futures-util = { version = "0.3", default-features = false }
+image = { version = "0.25.10", default-features = false, features = ["gif", "jpeg", "png", "tiff", "webp"] }
+lopdf = "0.42"
+quick-xml = "0.37"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 rustyline = "17"
 serde_json = "1"
-tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "time"] }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
+umya-spreadsheet = "3"
 walkdir = "2"
+zip = "8.6"
 
 [dev-dependencies]
 tempfile = "3"
