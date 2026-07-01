@@ -194,14 +194,15 @@ impl Agent {
 
         loop {
             if round_index >= round_budget {
-                spinner.pause_line().await;
-                if self
+                spinner.pause_for_prompt().await;
+                let keep_going = self
                     .tools
                     .ask(&format!(
                         "Finn has run {round_index} steps without finishing. Keep going?"
                     ))
-                    .await
-                {
+                    .await;
+                if keep_going {
+                    spinner.resume();
                     round_budget += ROUNDS_PER_BATCH;
                     call_budget += CALLS_PER_BATCH;
                 } else {
@@ -254,13 +255,22 @@ impl Agent {
 
             if !model_turn.tool_calls.is_empty() {
                 for call in model_turn.tool_calls {
-                    tool_calls += 1;
-                    if tool_calls > call_budget {
-                        bail!(
-                            "Finn stopped after {} tool calls without finishing.",
-                            tool_calls - 1
-                        );
+                    if tool_calls >= call_budget {
+                        spinner.pause_for_prompt().await;
+                        let keep_going = self
+                            .tools
+                            .ask(&format!(
+                                "Finn has run {tool_calls} tool calls without finishing. Keep going?"
+                            ))
+                            .await;
+                        if keep_going {
+                            spinner.resume();
+                            call_budget += CALLS_PER_BATCH;
+                        } else {
+                            bail!("Finn stopped after {tool_calls} tool calls without finishing.");
+                        }
                     }
+                    tool_calls += 1;
                     let signature = format!("{}\0{}", call.name, call.arguments);
                     let repeats = repeated_calls.entry(signature).or_default();
                     *repeats = repeats.saturating_add(1);
@@ -723,5 +733,68 @@ mod tests {
 
         let requests = server.await.unwrap();
         assert_eq!(requests.len(), ROUNDS_PER_BATCH);
+    }
+
+    #[tokio::test]
+    async fn extends_call_budget_inside_one_model_turn() {
+        let directory = tempfile::tempdir().unwrap();
+        let desktop = directory.path().join("Desktop");
+        tokio::fs::create_dir_all(&desktop).await.unwrap();
+        let output = (0..=CALLS_PER_BATCH)
+            .map(|index| {
+                json!({
+                    "type": "function_call",
+                    "call_id": format!("call_{index}"),
+                    "name": "path_status",
+                    "arguments": json!({
+                        "path": desktop.join(format!("probe_{index}")).to_string_lossy()
+                    }).to_string()
+                })
+            })
+            .collect::<Vec<_>>();
+        let tool_response = test_support::sse_openai(json!({
+            "id": "resp_tools",
+            "output": output,
+            "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+        }));
+        let final_response = test_support::sse_openai(json!({
+            "id": "resp_final",
+            "output": [{"type": "message", "content": [
+                {"type": "output_text", "text": "finished"}
+            ]}],
+            "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+        }));
+        let (base_url, server) = test_support::mock_http_server(vec![
+            ("200 OK", tool_response),
+            ("200 OK", final_response),
+        ])
+        .await;
+        let config = Config {
+            provider: Provider::OpenAi,
+            api_key: "test-key".to_owned(),
+            base_url,
+            model: "gpt-test".to_owned(),
+            vision_model: None,
+            reasoning_effort: "medium".to_owned(),
+            home: directory.path().to_path_buf(),
+            data_dir: directory.path().join("data"),
+        };
+        tokio::fs::create_dir_all(&config.data_dir).await.unwrap();
+        let tools = ToolContext::new(
+            config.home.clone(),
+            config.data_dir.clone(),
+            crate::tools::Confirmer::AutoAllow,
+        );
+        let mut agent = Agent::new(config, tools).unwrap();
+
+        let result = agent
+            .run_task("Inspect every file on my Desktop")
+            .await
+            .unwrap();
+        assert_eq!(result.answer, "finished");
+        assert_eq!(result.tool_calls, CALLS_PER_BATCH + 1);
+
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 2);
     }
 }

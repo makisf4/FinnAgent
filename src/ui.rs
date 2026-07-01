@@ -147,6 +147,22 @@ impl Spinner {
         }
     }
 
+    /// Suppresses animation while an interactive terminal prompt owns stdout.
+    /// Unlike [`pause_line`], this waits for the animation task to acknowledge
+    /// suppression so it cannot immediately redraw over the prompt.
+    pub async fn pause_for_prompt(&self) {
+        self.suppressed.store(true, Ordering::Release);
+        if self.task.is_none() {
+            return;
+        }
+        for _ in 0..40 {
+            if self.quiesced.load(Ordering::Acquire) {
+                return;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     /// Stops the animation and clears the spinner line.
     pub async fn stop(mut self) {
         self.stop.store(true, Ordering::Relaxed);
@@ -544,6 +560,10 @@ mod tests {
         let spinner = Spinner::start("Thinking");
         spinner.set_label("Running path status").await;
         spinner.pause_line().await;
+        spinner.pause_for_prompt().await;
+        assert!(spinner.suppressed.load(Ordering::Acquire));
+        spinner.resume();
+        assert!(!spinner.suppressed.load(Ordering::Acquire));
         spinner.stop().await;
     }
 
