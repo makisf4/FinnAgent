@@ -1,4 +1,3 @@
-mod openai;
 mod openrouter;
 
 use anyhow::Result;
@@ -8,10 +7,7 @@ use reqwest::{RequestBuilder, Response, StatusCode};
 use serde_json::Value;
 use tokio::time::{Duration, sleep};
 
-use crate::config::{Config, Provider};
-
-pub use openai::OpenAi;
-pub use openrouter::OpenRouter;
+pub use openrouter::OpenRouter as Backend;
 
 /// Receives assistant text deltas as they stream in. Tool-call deltas are not
 /// forwarded here; only user-visible answer text is.
@@ -71,12 +67,6 @@ pub struct Usage {
     pub total_tokens: u64,
 }
 
-#[derive(Clone)]
-pub enum Backend {
-    OpenAi(OpenAi),
-    OpenRouter(OpenRouter),
-}
-
 pub(super) async fn send_with_retry(request: RequestBuilder, service: &str) -> Result<Response> {
     const ATTEMPTS: usize = 3;
     for attempt in 0..ATTEMPTS {
@@ -108,8 +98,7 @@ fn retry_delay(attempt: usize) -> Duration {
     Duration::from_millis(500 * (1_u64 << attempt))
 }
 
-/// Maximum number of history items retained by either provider before
-/// compaction. Kept here so both wire-format implementations agree.
+/// Maximum number of history items retained before compaction.
 pub(super) const MAX_HISTORY_ITEMS: usize = 128;
 
 /// Drops the oldest history items when the log grows past `MAX_HISTORY_ITEMS`,
@@ -185,68 +174,25 @@ pub(crate) mod test_support {
         ])
     }
 
-    /// Wraps a complete OpenAI Responses `response` object as a streamed
-    /// `response.completed` event (plus [DONE]).
-    pub fn sse_openai(response: serde_json::Value) -> &'static str {
-        let event = serde_json::json!({"type": "response.completed", "response": response});
-        let body = format!("data: {event}\n\ndata: [DONE]\n\n");
-        Box::leak(body.into_boxed_str())
-    }
-}
-
-impl Backend {
-    pub fn checkpoint(&self) -> Self {
-        match self {
-            Self::OpenAi(provider) => Self::OpenAi(provider.clone()),
-            Self::OpenRouter(provider) => Self::OpenRouter(provider.fork()),
+    /// A Chat Completions response containing either content, tool calls, or
+    /// both. Tool calls are emitted as complete indexed deltas.
+    pub fn sse_chat(id: &str, mut delta: serde_json::Value) -> &'static str {
+        if let Some(calls) = delta
+            .get_mut("tool_calls")
+            .and_then(|value| value.as_array_mut())
+        {
+            for (index, call) in calls.iter_mut().enumerate() {
+                call["index"] = serde_json::json!(index);
+            }
         }
-    }
-
-    pub fn new(config: &Config) -> Self {
-        match config.provider {
-            Provider::OpenAi => Self::OpenAi(OpenAi::new(config)),
-            Provider::OpenRouter => Self::OpenRouter(OpenRouter::new(config)),
-        }
-    }
-
-    pub fn push_user(&mut self, task: &str) {
-        match self {
-            Self::OpenAi(provider) => provider.push_user(task),
-            Self::OpenRouter(provider) => provider.push_user(task),
-        }
-    }
-
-    pub fn push_user_image(&mut self, prompt: &str, data_url: &str) {
-        match self {
-            Self::OpenAi(provider) => provider.push_user_image(prompt, data_url),
-            Self::OpenRouter(provider) => provider.push_user_image(prompt, data_url),
-        }
-    }
-
-    pub fn push_tool_result(&mut self, call_id: &str, result: &str) {
-        match self {
-            Self::OpenAi(provider) => provider.push_tool_result(call_id, result),
-            Self::OpenRouter(provider) => provider.push_tool_result(call_id, result),
-        }
-    }
-
-    pub fn push_assistant(&mut self, answer: &str) {
-        match self {
-            Self::OpenAi(provider) => provider.push_assistant(answer),
-            Self::OpenRouter(provider) => provider.push_assistant(answer),
-        }
-    }
-
-    pub async fn create_turn(
-        &mut self,
-        client: &reqwest::Client,
-        tools: Vec<Value>,
-        sink: TextSink<'_>,
-    ) -> Result<ModelTurn> {
-        match self {
-            Self::OpenAi(provider) => provider.create_turn(client, tools, sink).await,
-            Self::OpenRouter(provider) => provider.create_turn(client, tools, sink).await,
-        }
+        sse_body(&[
+            serde_json::json!({"id": id, "choices": [{"delta": delta}]}),
+            serde_json::json!({
+                "id": id,
+                "choices": [{"delta": {}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            }),
+        ])
     }
 }
 

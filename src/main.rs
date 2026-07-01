@@ -33,15 +33,9 @@ async fn main() {
 async fn run() -> Result<()> {
     let args: Vec<String> = env::args().skip(1).collect();
     if args.first().is_some_and(|arg| arg == "--check") {
-        let provider = env::var("FINN_PROVIDER")
-            .unwrap_or_else(|_| "openai".to_owned())
-            .parse::<config::Provider>()?;
-        let model = env::var("FINN_MODEL").unwrap_or_else(|_| provider.default_model().to_owned());
+        let model = env::var("FINN_MODEL").unwrap_or_else(|_| "z-ai/glm-5.2".to_owned());
         let reasoning = env::var("FINN_REASONING").unwrap_or_else(|_| "medium".to_owned());
-        let key_name = match provider {
-            config::Provider::OpenAi => "OPENAI_API_KEY",
-            config::Provider::OpenRouter => "OPENROUTER_API_KEY",
-        };
+        let key_name = "OPENROUTER_API_KEY";
         let key_status = if env::var(key_name).is_ok_and(|key| !key.trim().is_empty()) {
             "set"
         } else {
@@ -49,7 +43,7 @@ async fn run() -> Result<()> {
         };
         println!("Finn check:");
         println!("version: {}", env!("CARGO_PKG_VERSION"));
-        println!("provider: {provider}");
+        println!("provider: openrouter");
         println!("model: {model}");
         println!("reasoning: {reasoning}");
         println!("tools: {}", tools::definitions().len());
@@ -156,29 +150,26 @@ async fn run() -> Result<()> {
                     for warning in &catalog.warnings {
                         eprintln!("Model catalog warning: {warning}");
                     }
-                    ui::render_models(config.provider, &config.model, &catalog.models);
+                    ui::render_models(&config.model, &catalog.models);
                     let selection = match editor.readline(&ui::prompt("model")) {
                         Ok(selection) => selection,
                         Err(ReadlineError::Interrupted | ReadlineError::Eof) => continue,
                         Err(error) => return Err(error.into()),
                     };
-                    match ui::resolve_model_selection(&selection, &catalog.models, config.provider)
-                    {
-                        Ok(Some((provider, model))) => match config.switched(provider, &model) {
-                            Ok(selected_config) => {
-                                let preserved_turns = agent.switch_model(selected_config.clone());
-                                config = selected_config;
-                                println!("Active model: {} [{}]", config.model, config.provider);
-                                if preserved_turns == 0 {
-                                    println!("Starting a fresh conversation on the new model.");
-                                } else {
-                                    println!(
-                                        "Replayed {preserved_turns} text turn(s) onto the new model. Tool results and image inputs from the previous model are not carried over."
-                                    );
-                                }
+                    match ui::resolve_model_selection(&selection, &catalog.models) {
+                        Ok(Some(model)) => {
+                            let selected_config = config.switched(&model);
+                            let preserved_turns = agent.switch_model(selected_config.clone());
+                            config = selected_config;
+                            println!("Active model: {}", config.model);
+                            if preserved_turns == 0 {
+                                println!("Starting a fresh conversation on the new model.");
+                            } else {
+                                println!(
+                                    "Replayed {preserved_turns} text turn(s) onto the new model. Tool results and image inputs from the previous model are not carried over."
+                                );
                             }
-                            Err(error) => eprintln!("Cannot select {model}: {error:#}"),
-                        },
+                        }
                         Ok(None) => {}
                         Err(error) => eprintln!("{error}"),
                     }

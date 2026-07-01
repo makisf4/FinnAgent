@@ -1,6 +1,6 @@
 # FinnAgent 0.4.0
 
-Finn is a Rust-based macOS assistant that executes natural-language tasks through either the OpenAI Responses API or OpenRouter Chat Completions API.
+Finn is a Rust-based macOS assistant that executes natural-language tasks through OpenRouter.
 
 Finn does not hand generated commands back to the user. An imperative task is authorization to execute the requested action. Questions remain read-only, deletion moves items to Trash, and catastrophic shell patterns are blocked.
 
@@ -23,6 +23,7 @@ Finn does not hand generated commands back to the user. An imperative task is au
 - Show a live activity indicator while thinking or running tools, then a per-task summary of model, reasoning effort, tool activity, API rounds, elapsed time, and real token usage
 - Stream the answer live as it is generated, and render Markdown (bold, code, lists) in the final reply
 - Work in batches: if a long task reaches the step budget without finishing, an interactive session asks whether to keep going instead of failing outright
+- Generate images with selected OpenRouter image models and save them under `~/Pictures/Finn`
 
 Apple Mail tools use AppleScript. macOS will request Automation permission the first time Finn accesses Mail.
 
@@ -30,13 +31,12 @@ Apple Mail tools use AppleScript. macOS will request Automation permission the f
 
 - macOS
 - Rust stable
-- An API key for OpenAI or OpenRouter with access to the configured model
+- An OpenRouter API key with access to the configured model
 
 ## Run
 
 ```bash
-export FINN_PROVIDER="openai"
-export OPENAI_API_KEY="your-key"
+export OPENROUTER_API_KEY="your-key"
 cd FinnAgent
 cargo run --release
 ```
@@ -63,19 +63,18 @@ rotate page 2 of ~/Downloads/scan.pdf by 90 degrees
 resize ~/Desktop/photo.jpg to 1200 by 800 pixels and save it as PNG
 ```
 
-Type `/models` during an interactive session to choose from OpenAI and GLM models
-or enter an exact custom model ID. The change takes effect immediately. Prior
-text turns are replayed onto the new model, but tool results and image inputs
-from the previous model are not carried over because those formats are not
-portable across providers. Finn reports how many turns were preserved when you
-switch. Selecting a GLM model switches to OpenRouter and requires
-`OPENROUTER_API_KEY`. The selection lasts for that Finn session; set
-`FINN_PROVIDER` and `FINN_MODEL` to change the startup defaults.
+Type `/models` during an interactive session to choose a curated OpenRouter
+model or enter an exact custom model ID. The list includes OpenAI, Anthropic,
+Google, xAI, DeepSeek, Qwen, Kimi, Mistral, MiniMax, Meta, Z.ai, and image
+generation models. The change takes effect immediately. Prior text turns are
+replayed onto the new model, but tool results and image inputs are not carried
+over. The selection lasts for that Finn session; set `FINN_MODEL` to change the
+startup default.
 
 Type `/` and press `Tab` to open slash-command completion with descriptions.
 Partial commands such as `/mo` can be completed to `/model` or `/models`.
-The model menu discovers current GPT-5 and Z.ai GLM IDs from the provider APIs,
-with a built-in fallback list when discovery is unavailable.
+The model menu validates the curated list against OpenRouter's live model
+metadata and falls back to a built-in list when discovery is unavailable.
 
 Type `/clear` (or `/reset`, `/new`) to discard the current conversation and start
 fresh on the same model. End a line with a backslash `\` to continue onto the
@@ -97,8 +96,9 @@ image objects, and visual data in tool-call arguments with a typed sanitation
 marker. OpenRouter `reasoning_details` are retained exactly for subsequent turns
 on the model that produced them and are not forwarded across models.
 
-Image understanding is supported. Image generation is not currently implemented,
-and Finn will not attempt to synthesize images through shell or filesystem tools.
+Image understanding is supported through assistant models. When an image
+generation model is active, natural-language input is sent to OpenRouter's
+`/images` API and the generated file is saved under `~/Pictures/Finn`.
 
 After every task, Finn displays input/output tokens for that task, cumulative session tokens, cached input, reasoning tokens, tool count, API rounds, and the final provider response ID.
 
@@ -118,31 +118,19 @@ cargo run --release -- --check
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `FINN_PROVIDER` | `openai` | Provider: `openai` or `openrouter` |
-| `OPENAI_API_KEY` | required for OpenAI | OpenAI API authentication |
 | `OPENROUTER_API_KEY` | required for OpenRouter | OpenRouter API authentication |
 | `OPENROUTER_BASE_URL` | `https://openrouter.ai/api/v1` | OpenRouter-compatible API base URL |
-| `FINN_MODEL` | provider-specific | `gpt-5.5` for OpenAI; `z-ai/glm-5.2` for OpenRouter |
-| `FINN_VISION_MODEL` | `z-ai/glm-5v-turbo` on OpenRouter | Model used automatically for local image input |
-| `FINN_REASONING` | `medium` | Provider reasoning configuration |
+| `FINN_MODEL` | `z-ai/glm-5.2` | Startup OpenRouter model |
+| `FINN_VISION_MODEL` | `z-ai/glm-5v-turbo` | Model used automatically for local image input |
+| `FINN_REASONING` | `medium` | OpenRouter reasoning configuration |
 | `FINN_HOME` | `~/Library/Application Support/FinnAgent` | Local task log directory |
 | `FINN_TASK_LOG` | `off` | Set to `1`, `true`, `yes`, or `on` to retain local task summaries |
 | `FINN_ENABLE_SHELL` | `off` | Opt in to `run_shell`; still requires an explicit shell request and an untainted session |
 | `FINN_MAIL_SENDER` | first enabled account | Preferred Apple Mail sender address; defaults to the first enabled Apple Mail account |
 
-OpenAI setup:
-
-```bash
-export FINN_PROVIDER="openai"
-export OPENAI_API_KEY="..."
-export FINN_MODEL="gpt-5.5"
-cargo run --release
-```
-
 OpenRouter setup:
 
 ```bash
-export FINN_PROVIDER=openrouter
 export OPENROUTER_API_KEY="..."
 export FINN_MODEL="z-ai/glm-5.2"
 cargo run --release
@@ -150,7 +138,7 @@ cargo run --release
 
 ## Execution Model
 
-1. Finn submits the user's task and typed tool definitions using the selected provider's API format.
+1. Finn submits the user's task and typed tool definitions through OpenRouter.
 2. The model returns function calls.
 3. Rust executes each call immediately through an audited handler.
 4. Tool results are returned to the model.
@@ -162,8 +150,8 @@ from the model's tools unless `FINN_ENABLE_SHELL=1`; when enabled it requires an
 explicit shell request, skips startup files, and receives a minimal environment
 without provider API keys.
 
-OpenAI uses the Responses API. OpenRouter uses `POST /chat/completions` and
-OpenAI-compatible function tools. Transient connection failures, HTTP 429
+OpenRouter uses `POST /chat/completions` with OpenAI-compatible function tools,
+and `POST /images` for image-generation models. Transient connection failures, HTTP 429
 responses, and server errors are retried with bounded backoff. Requests have
 connect and overall timeouts. OpenRouter requests also include trusted host
 context collected from macOS (`sw_vers`, `uname -m`, and `$SHELL`) so generated

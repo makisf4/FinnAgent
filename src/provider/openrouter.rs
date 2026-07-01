@@ -52,6 +52,10 @@ impl OpenRouter {
         }
     }
 
+    pub fn checkpoint(&self) -> Self {
+        self.fork()
+    }
+
     pub async fn create_turn(
         &mut self,
         client: &reqwest::Client,
@@ -166,7 +170,6 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::config::Provider;
     use crate::provider::test_support;
 
     #[test]
@@ -212,10 +215,10 @@ mod tests {
         let body = test_support::sse_text("gen_mock", "ok");
         let (base_url, server) = test_support::mock_http_server(vec![("200 OK", body)]).await;
         let config = Config {
-            provider: Provider::OpenRouter,
             api_key: "test-key".to_owned(),
             base_url,
             model: "router/test".to_owned(),
+            model_kind: crate::config::ModelKind::Assistant,
             vision_model: None,
             reasoning_effort: "medium".to_owned(),
             home: PathBuf::from("/tmp"),

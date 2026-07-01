@@ -103,13 +103,9 @@ mod tests {
     #[tokio::test]
     async fn child_shell_does_not_inherit_provider_secrets() {
         let temp = tempfile::tempdir().unwrap();
-        let result = run(
-            "test -z \"$OPENAI_API_KEY\" && test -z \"$OPENROUTER_API_KEY\"",
-            temp.path(),
-            10,
-        )
-        .await
-        .unwrap();
+        let result = run("test -z \"$OPENROUTER_API_KEY\"", temp.path(), 10)
+            .await
+            .unwrap();
         assert!(result.contains("exit_code: 0"));
     }
 }

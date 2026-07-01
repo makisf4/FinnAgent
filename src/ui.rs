@@ -9,7 +9,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{Duration, sleep};
 
 use crate::agent::{TaskResult, Usage};
-use crate::config::{Config, ModelOption, Provider};
+use crate::config::{Config, ModelOption};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const CYAN: &str = "\x1b[36m";
@@ -260,17 +260,14 @@ pub fn render_startup(config: &Config, tool_count: usize) {
         (
             format!(
                 "model {}  reasoning {}  tools {}  api {}",
-                config.model,
-                config.reasoning_effort,
-                tool_count,
-                config.provider.api_label()
+                config.model, config.reasoning_effort, tool_count, "OpenRouter"
             ),
             format!(
                 "{}  {}  {}  {}",
                 field("model", &config.model),
                 field("reasoning", &config.reasoning_effort),
                 field("tools", &tool_count.to_string()),
-                field("api", config.provider.api_label())
+                field("api", "OpenRouter")
             ),
         ),
     ];
@@ -345,10 +342,10 @@ pub fn render_commands() {
     println!();
 }
 
-pub fn render_models(active_provider: Provider, active_model: &str, models: &[ModelOption]) {
+pub fn render_models(active_model: &str, models: &[ModelOption]) {
     println!("{}", style("Available models", &format!("{BOLD}{BLUE}")));
     for (index, model) in models.iter().enumerate() {
-        let is_active = model.provider == active_provider && model.id == active_model;
+        let is_active = model.id == active_model;
         let marker = if is_active {
             style("●", GREEN)
         } else {
@@ -364,7 +361,7 @@ pub fn render_models(active_provider: Provider, active_model: &str, models: &[Mo
             marker,
             index + 1,
             id,
-            style(&format!("[{}]", model.provider), DIM)
+            style(&format!("[{}]", model.kind.label()), DIM)
         );
     }
     println!();
@@ -380,8 +377,7 @@ pub fn render_models(active_provider: Provider, active_model: &str, models: &[Mo
 pub fn resolve_model_selection(
     input: &str,
     models: &[ModelOption],
-    custom_provider: Provider,
-) -> Result<Option<(Provider, String)>, String> {
+) -> Result<Option<ModelOption>, String> {
     let selection = input.trim();
     if selection.is_empty() {
         return Ok(None);
@@ -389,10 +385,13 @@ pub fn resolve_model_selection(
     if let Ok(index) = selection.parse::<usize>() {
         return models
             .get(index.wrapping_sub(1))
-            .map(|model| Some((model.provider, model.id.clone())))
+            .map(|model| Some(model.clone()))
             .ok_or_else(|| format!("Model selection must be between 1 and {}.", models.len()));
     }
-    Ok(Some((custom_provider, selection.to_owned())))
+    Ok(Some(ModelOption {
+        id: selection.to_owned(),
+        kind: crate::config::model_kind_for_id(selection),
+    }))
 }
 
 pub fn clear_screen() {
@@ -624,26 +623,26 @@ mod tests {
     fn resolves_menu_and_custom_model_selections() {
         let models = [
             ModelOption {
-                provider: Provider::OpenAi,
                 id: "model-a".to_owned(),
+                kind: crate::config::ModelKind::Assistant,
             },
             ModelOption {
-                provider: Provider::OpenRouter,
                 id: "model-b".to_owned(),
+                kind: crate::config::ModelKind::ImageGeneration,
             },
         ];
         assert_eq!(
-            resolve_model_selection("2", &models, Provider::OpenAi).unwrap(),
-            Some((Provider::OpenRouter, "model-b".to_owned()))
+            resolve_model_selection("2", &models).unwrap(),
+            Some(models[1].clone())
         );
         assert_eq!(
-            resolve_model_selection("provider/custom", &models, Provider::OpenAi).unwrap(),
-            Some((Provider::OpenAi, "provider/custom".to_owned()))
+            resolve_model_selection("provider/custom", &models).unwrap(),
+            Some(ModelOption {
+                id: "provider/custom".to_owned(),
+                kind: crate::config::ModelKind::Assistant,
+            })
         );
-        assert_eq!(
-            resolve_model_selection("", &models, Provider::OpenAi).unwrap(),
-            None
-        );
-        assert!(resolve_model_selection("3", &models, Provider::OpenAi).is_err());
+        assert_eq!(resolve_model_selection("", &models).unwrap(), None);
+        assert!(resolve_model_selection("3", &models).is_err());
     }
 }
