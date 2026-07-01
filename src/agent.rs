@@ -215,14 +215,20 @@ impl Agent {
             // Stream assistant text live. The first delta suppresses the spinner
             // and prints the answer header; subsequent deltas append in place.
             let suppressor = spinner.suppressor();
+            let quiesced = spinner.quiesced_flag();
             let mut streamed_any = false;
             let model_turn = {
                 let streamed = &mut streamed_any;
                 let suppressor = &suppressor;
+                let quiesced = &quiesced;
                 let mut sink = move |delta: &str| {
                     use std::io::Write;
                     if !*streamed {
+                        // Ask the animation to stop drawing, then wait until it
+                        // confirms the line is clear. Without this the spinner's
+                        // next frame can wipe the answer's first characters.
                         suppressor.store(true, std::sync::atomic::Ordering::Relaxed);
+                        ui::wait_until_quiet(quiesced);
                         *streamed = true;
                         print!("\r\x1b[2K{}\n", ui::answer_header());
                     }

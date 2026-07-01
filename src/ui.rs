@@ -33,6 +33,11 @@ pub struct Spinner {
     label: Arc<Mutex<String>>,
     stop: Arc<AtomicBool>,
     suppressed: Arc<AtomicBool>,
+    /// Set by the animation task once it has cleared its line in response to
+    /// `suppressed`, and cleared again on `resume`. A streaming sink waits for
+    /// this before writing so the animation cannot overwrite the answer's first
+    /// bytes (the classic "the first characters are cut off" race).
+    quiesced: Arc<AtomicBool>,
     task: Option<JoinHandle<()>>,
 }
 
@@ -43,17 +48,23 @@ impl Spinner {
         let label = Arc::new(Mutex::new(label.into()));
         let stop = Arc::new(AtomicBool::new(false));
         let suppressed = Arc::new(AtomicBool::new(false));
+        let quiesced = Arc::new(AtomicBool::new(false));
         if !io::stdout().is_terminal() || !color_enabled() {
+            // No animation runs, so a sink never has to wait for the line to be
+            // clear: mark it quiesced up front.
+            quiesced.store(true, Ordering::Relaxed);
             return Self {
                 label,
                 stop,
                 suppressed,
+                quiesced,
                 task: None,
             };
         }
         let task_label = Arc::clone(&label);
         let task_stop = Arc::clone(&stop);
         let task_suppressed = Arc::clone(&suppressed);
+        let task_quiesced = Arc::clone(&quiesced);
         let task = tokio::spawn(async move {
             let started = Instant::now();
             let mut frame = 0_usize;
@@ -68,10 +79,14 @@ impl Spinner {
                         let _ = out.flush();
                         cleared = true;
                     }
+                    // Announce that the line is clear and we are done drawing so
+                    // a waiting streaming sink can safely take over the line.
+                    task_quiesced.store(true, Ordering::Release);
                     sleep(Duration::from_millis(50)).await;
                     continue;
                 }
                 cleared = false;
+                task_quiesced.store(false, Ordering::Relaxed);
                 let text = task_label.lock().await.clone();
                 let glyph = SPINNER_FRAMES[frame % SPINNER_FRAMES.len()];
                 let elapsed = started.elapsed().as_secs_f64();
@@ -91,18 +106,28 @@ impl Spinner {
             label,
             stop,
             suppressed,
+            quiesced,
             task: Some(task),
         }
     }
 
     /// Returns the flag the animation checks to suppress drawing. Flipping it to
-    /// `true` lets a synchronous streaming sink take over the line safely.
+    /// `true` lets a synchronous streaming sink take over the line safely. After
+    /// setting it, callers must call [`wait_until_quiet`] before writing so the
+    /// animation cannot overwrite the first bytes they emit.
     pub fn suppressor(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.suppressed)
     }
 
+    /// The acknowledgement flag the animation sets once it has cleared its line
+    /// and stopped drawing in response to suppression. See [`wait_until_quiet`].
+    pub fn quiesced_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.quiesced)
+    }
+
     /// Re-enables animation after a suppressed stretch.
     pub fn resume(&self) {
+        self.quiesced.store(false, Ordering::Relaxed);
         self.suppressed.store(false, Ordering::Relaxed);
     }
 
@@ -145,6 +170,22 @@ impl Drop for Spinner {
             let _ = write!(out, "\r\x1b[2K");
             let _ = out.flush();
         }
+    }
+}
+
+/// Blocks until the spinner animation has acknowledged suppression by clearing
+/// its line, so a synchronous streaming sink can write without the animation
+/// overwriting the first bytes of the answer. `quiesced` is the flag from
+/// [`Spinner::quiesced_flag`]. The wait is bounded so a missing or already
+/// stopped animation can never hang the caller.
+pub fn wait_until_quiet(quiesced: &AtomicBool) {
+    // The animation polls suppression every ~50ms; a handful of short spins
+    // comfortably covers one poll interval without a hard dependency on timing.
+    for _ in 0..400 {
+        if quiesced.load(Ordering::Acquire) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(1));
     }
 }
 
@@ -504,6 +545,34 @@ mod tests {
         spinner.set_label("Running path status").await;
         spinner.pause_line().await;
         spinner.stop().await;
+    }
+
+    #[tokio::test]
+    async fn inert_spinner_reports_quiesced_so_sinks_never_block() {
+        // Without a terminal there is no animation to overwrite streamed output,
+        // so a waiting sink must observe the line as already quiet and not spin
+        // for the full timeout.
+        let spinner = Spinner::start("Thinking");
+        assert!(spinner.quiesced_flag().load(Ordering::Acquire));
+        let started = Instant::now();
+        wait_until_quiet(&spinner.quiesced_flag());
+        assert!(started.elapsed() < Duration::from_millis(50));
+        spinner.stop().await;
+    }
+
+    #[test]
+    fn wait_until_quiet_returns_once_the_flag_is_set() {
+        let flag = AtomicBool::new(false);
+        // A brief spin then set from another thread mirrors the animation task
+        // acknowledging suppression while the sink waits.
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(Duration::from_millis(5));
+                flag.store(true, Ordering::Release);
+            });
+            wait_until_quiet(&flag);
+        });
+        assert!(flag.load(Ordering::Acquire));
     }
 
     #[test]
