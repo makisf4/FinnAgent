@@ -166,11 +166,23 @@ impl TaskAuthorization {
             .has_phrase(&["shell", "terminal", "command", "script", "bash", "zsh"])
             || text.has_phrase(&["γραμμή εντολών", "γραμμη εντολων"])
             || text.has_stem(&["τερματικ"]);
-        let write_verb = text.has_phrase(&["write", "create", "save", "make"]);
-        let file_noun = text.has_phrase(&["file", "report", "summary", "note", "script"]);
-        let allow_file_write = (write_verb && file_noun)
-            || (text.has_phrase(&["γράψε", "γραψε"]) && text.has_stem(&["αρχ"]))
-            || (text.has_stem(&["δημιούργησ", "δημιουργησ"]) && text.has_stem(&["αρχ"]));
+        let write_verb = text.has_phrase(&["write", "create", "save", "make"])
+            || text.has_stem(&["γραψ", "δημιουργησ", "φτιαξ", "βαλ"]);
+        let file_noun = text.has_phrase(&[
+            "file",
+            "files",
+            "report",
+            "reports",
+            "summary",
+            "summaries",
+            "note",
+            "notes",
+            "script",
+            "scripts",
+            "txt",
+        ]) || text.has_stem(&["αρχε"])
+            || text.has_file_extension();
+        let allow_file_write = write_verb && file_noun;
         let allow_directory_create = ((text.has_phrase(&["create", "make"]))
             && text.has_phrase(&["folder", "directory"]))
             || (text.has_stem(&["δημιούργησ", "δημιουργησ", "φτιάξ", "φτιαξ"])
@@ -925,9 +937,10 @@ struct TaskText {
 impl TaskText {
     fn new(task: &str) -> Self {
         let raw = task.to_lowercase();
+        let normalized = normalize_for_matching(task);
         // Split on any non-alphanumeric character except a few that appear
         // inside file names and paths, so tokens stay meaningful.
-        let tokens: Vec<String> = raw
+        let tokens: Vec<String> = normalized
             .split(|character: char| {
                 !(character.is_alphanumeric() || matches!(character, '.' | '_' | '+' | '-' | '/'))
             })
@@ -938,7 +951,7 @@ impl TaskText {
         // punctuation but keep alphanumerics together. Apostrophes are kept
         // inside words so contractions like "what's" and possessives like
         // "alex's" survive as single tokens and match apostrophe phrases.
-        let words: Vec<&str> = raw
+        let words: Vec<&str> = normalized
             .split(|character: char| !(character.is_alphanumeric() || character == '\''))
             .map(|word| word.trim_matches('\''))
             .filter(|word| !word.is_empty())
@@ -998,6 +1011,29 @@ impl TaskText {
                 .any(|extension| token.ends_with(extension))
         })
     }
+}
+
+/// Lowercases authorization input and removes Greek vowel diacritics.
+///
+/// Greek inflection frequently moves the accent within a word (for example,
+/// `φάκελος` -> `φακέλους`). Authorization must not depend on where the user
+/// placed that accent, and decomposed Unicode input should behave like
+/// precomposed input.
+fn normalize_for_matching(task: &str) -> String {
+    task.to_lowercase()
+        .chars()
+        .filter_map(|character| match character {
+            '\u{0300}'..='\u{036f}' => None,
+            'ά' => Some('α'),
+            'έ' => Some('ε'),
+            'ή' => Some('η'),
+            'ί' | 'ϊ' | 'ΐ' => Some('ι'),
+            'ό' => Some('ο'),
+            'ύ' | 'ϋ' | 'ΰ' => Some('υ'),
+            'ώ' => Some('ω'),
+            _ => Some(character),
+        })
+        .collect()
 }
 
 fn extract_recipient_hashes(task: &str) -> ([u64; 4], u8) {
@@ -1612,6 +1648,21 @@ mod tests {
                 &[FileWrite],
                 &[MailSend, Trash, DirCreate],
             ),
+            (
+                "Create 12 folders on my Desktop named January through December. Inside each folder, create 7 empty TXT files named Monday.txt through Sunday.txt.",
+                &[DirCreate, FileWrite, FileRead],
+                &[MailSend, Trash, Shell],
+            ),
+            (
+                "φτιάξε μου 12 φακέλους με τα ονόματα των μηνών στο Desktop και μέσα βάλε 7 txt με τα ονόματα των ημερών",
+                &[DirCreate, FileWrite, FileRead],
+                &[MailSend, Trash, Shell],
+            ),
+            (
+                "χρησιμοποίησε bash και φτιάξε μου 12 φακέλους με τα ονόματα των μηνών στο Desktop και μέσα βάλε 7 txt με τα ονόματα των ημερών",
+                &[DirCreate, FileWrite, FileRead, Shell],
+                &[MailSend, Trash],
+            ),
             // Deletion routes to Trash only for filesystem targets.
             ("Delete note.txt", &[Trash], &[MailSend, Shell]),
             ("Move that folder to Trash", &[Trash], &[MailSend, Shell]),
@@ -1760,6 +1811,12 @@ mod tests {
         let text = TaskText::new("send it's contents");
         assert!(!text.has_phrase(&["it"]));
         assert!(text.has_phrase(&["it's contents"]));
+
+        let text = TaskText::new("Φτιάξε φακέλους και βάλε αρχεία");
+        assert!(text.has_stem(&["φτιαξ"]));
+        assert!(text.has_stem(&["φακελ"]));
+        assert!(text.has_stem(&["βαλ"]));
+        assert!(text.has_stem(&["αρχε"]));
     }
 
     #[test]
