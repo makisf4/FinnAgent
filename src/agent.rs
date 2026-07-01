@@ -68,6 +68,15 @@ pub struct Agent {
     turn: u64,
 }
 
+/// A snapshot of the agent's mutable conversation state, used to restore a
+/// consistent session after a task is cancelled mid-flight.
+pub struct AgentCheckpoint {
+    backend: Backend,
+    conversation_len: usize,
+    untrusted_external_context: bool,
+    turn: u64,
+}
+
 #[derive(Clone, Debug)]
 pub struct TaskResult {
     pub answer: String,
@@ -359,6 +368,40 @@ impl Agent {
         preserved_turns
     }
 
+    /// Clears the conversation and starts a fresh session on the same model.
+    /// Provider history, the untrusted-data taint, and the turn counter are all
+    /// reset; cumulative session token usage is retained for reporting. Returns
+    /// the number of turns that were discarded.
+    pub fn reset(&mut self) -> usize {
+        let discarded = self.conversation.len();
+        self.backend = Backend::new(&self.config);
+        self.conversation.clear();
+        self.untrusted_external_context = false;
+        self.turn = 0;
+        discarded
+    }
+
+    /// Captures a snapshot of the mutable conversation state so a cancelled
+    /// task can be rolled back to a consistent point.
+    pub fn checkpoint(&self) -> AgentCheckpoint {
+        AgentCheckpoint {
+            backend: self.backend.checkpoint(),
+            conversation_len: self.conversation.len(),
+            untrusted_external_context: self.untrusted_external_context,
+            turn: self.turn,
+        }
+    }
+
+    /// Restores a previously captured snapshot, discarding any partial state a
+    /// cancelled task left behind. Cumulative session usage is intentionally
+    /// retained, since those tokens were really spent.
+    pub fn restore(&mut self, checkpoint: AgentCheckpoint) {
+        self.backend = checkpoint.backend;
+        self.conversation.truncate(checkpoint.conversation_len);
+        self.untrusted_external_context = checkpoint.untrusted_external_context;
+        self.turn = checkpoint.turn;
+    }
+
     async fn append_failure_log(&self, task: &str, error: &anyhow::Error) {
         let _ = self
             .tools
@@ -485,6 +528,58 @@ mod tests {
         let final_request = requests.last().unwrap();
         assert!(final_request.contains("clean turn"));
         assert!(!final_request.contains("poisoned failed turn"));
+    }
+
+    #[tokio::test]
+    async fn reset_starts_a_fresh_conversation() {
+        let ok = |id: &str, text: &str| {
+            test_support::sse_openai(json!({
+                "id": id,
+                "output": [{"type": "message", "content": [
+                    {"type": "output_text", "text": text}
+                ]}],
+                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+            }))
+        };
+        let (base_url, server) = test_support::mock_http_server(vec![
+            ("200 OK", ok("resp_1", "first")),
+            ("200 OK", ok("resp_2", "second")),
+        ])
+        .await;
+        let directory = tempfile::tempdir().unwrap();
+        let config = Config {
+            provider: Provider::OpenAi,
+            api_key: "test-key".to_owned(),
+            base_url,
+            model: "gpt-test".to_owned(),
+            vision_model: None,
+            reasoning_effort: "medium".to_owned(),
+            home: PathBuf::from(directory.path()),
+            data_dir: directory.path().join("data"),
+        };
+        tokio::fs::create_dir_all(&config.data_dir).await.unwrap();
+        let tools = ToolContext::new(
+            config.home.clone(),
+            config.data_dir.clone(),
+            crate::tools::Confirmer::AutoAllow,
+        );
+        let mut agent = Agent::new(config, tools).unwrap();
+
+        assert_eq!(
+            agent.run_task("remember apples").await.unwrap().answer,
+            "first"
+        );
+        assert_eq!(agent.reset(), 1);
+        assert_eq!(
+            agent.run_task("second question").await.unwrap().answer,
+            "second"
+        );
+
+        let requests = server.await.unwrap();
+        // After a reset, the earlier turn must not be replayed to the provider,
+        // and the turn counter restarts from 1.
+        assert!(requests[1].contains("second question"));
+        assert!(!requests[1].contains("remember apples"));
     }
 
     #[tokio::test]

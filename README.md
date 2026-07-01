@@ -77,6 +77,13 @@ Partial commands such as `/mo` can be completed to `/model` or `/models`.
 The model menu discovers current GPT-5 and Z.ai GLM IDs from the provider APIs,
 with a built-in fallback list when discovery is unavailable.
 
+Type `/clear` (or `/reset`, `/new`) to discard the current conversation and start
+fresh on the same model. End a line with a backslash `\` to continue onto the
+next line, and unclosed triple-backtick code fences keep reading until closed, so
+multi-line tasks and pasted code blocks work at the prompt. Press `Ctrl-C` while a
+task is running to cancel it and return to the prompt with the conversation
+unchanged; `Ctrl-C` at an empty prompt exits Finn.
+
 Paste or drag a local PNG, JPEG, WEBP, or GIF path into the prompt to send the
 image to a vision-capable model. Finn reads and Base64-encodes the local file; it
 never asks the model to open the filesystem path directly.

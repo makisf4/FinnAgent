@@ -15,7 +15,7 @@ use std::env;
 use agent::Agent;
 use anyhow::Result;
 use config::Config;
-use prompt::SlashHelper;
+use prompt::{SlashHelper, normalize_multiline};
 use rustyline::config::BellStyle;
 use rustyline::error::ReadlineError;
 use rustyline::history::DefaultHistory;
@@ -114,7 +114,10 @@ async fn run() -> Result<()> {
             Err(ReadlineError::Interrupted | ReadlineError::Eof) => break,
             Err(error) => return Err(error.into()),
         };
-        let task = line.trim();
+        // Join backslash line-continuations; fenced/plain multi-line text is
+        // preserved so scripts and code blocks paste cleanly.
+        let joined = normalize_multiline(&line);
+        let task = joined.trim();
         if task.is_empty() {
             continue;
         }
@@ -137,6 +140,16 @@ async fn run() -> Result<()> {
         if task.starts_with('/') {
             match task.to_ascii_lowercase().as_str() {
                 "/commands" | "/help" => ui::render_commands(),
+                "/clear" | "/reset" | "/new" => {
+                    let discarded = agent.reset();
+                    ui::clear_screen();
+                    ui::render_startup(&config, tools::definitions().len());
+                    if discarded == 0 {
+                        println!("Started a fresh conversation.");
+                    } else {
+                        println!("Cleared {discarded} turn(s); started a fresh conversation.");
+                    }
+                }
                 "/model" | "/models" => {
                     println!("Loading available models...");
                     let catalog = catalog::discover().await;
@@ -180,9 +193,19 @@ async fn run() -> Result<()> {
         }
         editor.add_history_entry(task)?;
 
-        match agent.run_task(task).await {
-            Ok(result) => ui::render_task_result(&result, &config.reasoning_effort),
-            Err(error) => eprintln!("Task failed: {error:#}"),
+        // Run the task but let Ctrl-C cancel it mid-flight. On cancellation we
+        // restore the pre-task snapshot so the session stays consistent, then
+        // return to the prompt instead of exiting.
+        let checkpoint = agent.checkpoint();
+        tokio::select! {
+            outcome = agent.run_task(task) => match outcome {
+                Ok(result) => ui::render_task_result(&result, &config.reasoning_effort),
+                Err(error) => eprintln!("Task failed: {error:#}"),
+            },
+            _ = tokio::signal::ctrl_c() => {
+                agent.restore(checkpoint);
+                println!("\nCancelled. Returned to the prompt; the conversation is unchanged.");
+            }
         }
     }
 

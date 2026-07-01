@@ -134,6 +134,20 @@ impl Spinner {
     }
 }
 
+impl Drop for Spinner {
+    fn drop(&mut self) {
+        // If the owning task is cancelled (e.g. Ctrl-C) without calling stop(),
+        // signal the animation to end and clear the line so the terminal is not
+        // left with a dangling spinner or a background task still drawing.
+        self.stop.store(true, Ordering::Relaxed);
+        if self.task.is_some() {
+            let mut out = io::stdout().lock();
+            let _ = write!(out, "\r\x1b[2K");
+            let _ = out.flush();
+        }
+    }
+}
+
 pub struct CommandSpec {
     pub name: &'static str,
     pub description: &'static str,
@@ -155,6 +169,10 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "/models",
         description: "Select the active model",
+    },
+    CommandSpec {
+        name: "/clear",
+        description: "Start a fresh conversation",
     },
     CommandSpec {
         name: "/exit",
@@ -236,7 +254,14 @@ pub fn render_startup(config: &Config, tool_count: usize) {
     println!(
         "{}",
         style(
-            "Type / then Tab for commands  ·  Up/Down for history  ·  Ctrl-C to exit.",
+            "Type / then Tab for commands  ·  /clear to reset  ·  end a line with \\ for multi-line.",
+            DIM
+        )
+    );
+    println!(
+        "{}",
+        style(
+            "Ctrl-C cancels a running task  ·  Ctrl-C at the prompt exits.",
             DIM
         )
     );
