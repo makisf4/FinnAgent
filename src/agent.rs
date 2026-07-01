@@ -284,6 +284,11 @@ impl Agent {
                     spinner
                         .set_label(format!("Running {}", ui::tool_label(&call.name)))
                         .await;
+                    let pauses_for_confirmation =
+                        tool_may_request_confirmation(&call.name, &call.arguments);
+                    if pauses_for_confirmation {
+                        spinner.pause_for_prompt().await;
+                    }
                     let result = self
                         .tools
                         .execute(&call.name, &call.arguments, authorization)
@@ -309,6 +314,9 @@ impl Agent {
                     };
                     spinner.pause_line().await;
                     ui::render_tool_call(tool_calls, &call.name, status);
+                    if pauses_for_confirmation {
+                        spinner.resume();
+                    }
                     let detail = (status != "complete")
                         .then(|| result.chars().take(500).collect::<String>());
                     tool_events.push(json!({
@@ -455,6 +463,16 @@ fn activates_untrusted_context(tool_name: &str, result: &str) -> bool {
     ) && !result.starts_with("ERROR:")
 }
 
+fn tool_may_request_confirmation(tool_name: &str, arguments: &str) -> bool {
+    if matches!(tool_name, "mail_send" | "move_to_trash") {
+        return true;
+    }
+    serde_json::from_str::<serde_json::Value>(arguments)
+        .ok()
+        .and_then(|value| value.get("overwrite").and_then(serde_json::Value::as_bool))
+        .unwrap_or(false)
+}
+
 pub(crate) fn instructions(model: &str, reasoning_effort: &str) -> String {
     format!(
         "{INSTRUCTIONS}\nRuntime configuration:\n- model: {model}\n- reasoning effort: {reasoning_effort}\nWhen asked, state these exact configured values."
@@ -491,6 +509,21 @@ mod tests {
             "mail_save_attachment",
             "status: complete"
         ));
+    }
+
+    #[test]
+    fn identifies_tool_calls_that_may_prompt() {
+        assert!(tool_may_request_confirmation("mail_send", "{}"));
+        assert!(tool_may_request_confirmation("move_to_trash", "{}"));
+        assert!(tool_may_request_confirmation(
+            "write_file",
+            r#"{"overwrite":true}"#
+        ));
+        assert!(!tool_may_request_confirmation(
+            "write_file",
+            r#"{"overwrite":false}"#
+        ));
+        assert!(!tool_may_request_confirmation("path_status", "{}"));
     }
 
     #[tokio::test]
