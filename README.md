@@ -37,7 +37,7 @@ Apple Mail tools use AppleScript. macOS will request Automation permission the f
 ```bash
 export FINN_PROVIDER="openai"
 export OPENAI_API_KEY="your-key"
-cd /Users/makpap/Desktop/Projects/FinnAgent
+cd FinnAgent
 cargo run --release
 ```
 
