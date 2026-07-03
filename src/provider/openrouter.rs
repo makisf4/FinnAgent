@@ -82,6 +82,13 @@ fn chat_tool_definitions(tools: Vec<Value>) -> Vec<Value> {
     tools
         .into_iter()
         .map(|tool| {
+            if tool
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| kind.starts_with("openrouter:"))
+            {
+                return tool;
+            }
             let object = tool.as_object().expect("tool definitions are objects");
             let mut function = Map::new();
             for key in ["name", "description", "strict", "parameters"] {
@@ -113,6 +120,19 @@ fn parse_response(response: &Value) -> Result<ModelTurn> {
         .filter(|text| !text.is_empty())
         .map(str::to_owned);
     let usage = response.get("usage").unwrap_or(&Value::Null);
+    let server_tool_use = usage.get("server_tool_use").unwrap_or(&Value::Null);
+    let web_search_requests = server_tool_use
+        .get("web_search_requests")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let web_fetch_requests = server_tool_use
+        .get("web_fetch_requests")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let has_web_annotations = message
+        .get("annotations")
+        .and_then(Value::as_array)
+        .is_some_and(|annotations| !annotations.is_empty());
 
     Ok(ModelTurn {
         model: String::new(),
@@ -142,7 +162,13 @@ fn parse_response(response: &Value) -> Result<ModelTurn> {
                 .get("total_tokens")
                 .and_then(Value::as_u64)
                 .unwrap_or(0),
+            web_search_requests,
+            web_fetch_requests,
+            web_grounded_responses: u64::from(has_web_annotations),
         },
+        used_untrusted_server_tool: web_search_requests > 0
+            || web_fetch_requests > 0
+            || has_web_annotations,
         tool_calls,
         answer,
     })
@@ -210,6 +236,66 @@ mod tests {
         assert!(error.contains("OpenRouter tool-call format mismatch"));
     }
 
+    #[test]
+    fn preserves_openrouter_server_tools_on_the_wire() {
+        let tools = chat_tool_definitions(vec![
+            json!({
+                "type": "openrouter:web_search",
+                "parameters": {"max_results": 5}
+            }),
+            json!({
+                "type": "function",
+                "name": "path_status",
+                "description": "Inspect a path",
+                "strict": true,
+                "parameters": {"type": "object"}
+            }),
+        ]);
+        assert_eq!(tools[0]["type"], "openrouter:web_search");
+        assert_eq!(tools[0]["parameters"]["max_results"], 5);
+        assert_eq!(tools[1]["type"], "function");
+        assert_eq!(tools[1]["function"]["name"], "path_status");
+    }
+
+    #[test]
+    fn records_server_web_tool_usage_as_untrusted() {
+        let response = json!({
+            "choices": [{"message": {"role": "assistant", "content": "grounded answer"}}],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "total_tokens": 15,
+                "server_tool_use": {
+                    "web_search_requests": 2,
+                    "web_fetch_requests": 1
+                }
+            }
+        });
+        let turn = parse_response(&response).unwrap();
+        assert!(turn.used_untrusted_server_tool);
+        assert_eq!(turn.usage.web_search_requests, 2);
+        assert_eq!(turn.usage.web_fetch_requests, 1);
+    }
+
+    #[test]
+    fn citation_annotations_also_mark_web_usage_as_untrusted() {
+        let response = json!({
+            "choices": [{"message": {
+                "role": "assistant",
+                "content": "grounded answer",
+                "annotations": [{
+                    "type": "url_citation",
+                    "url_citation": {"url": "https://example.com", "title": "Example"}
+                }]
+            }}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+        });
+        let turn = parse_response(&response).unwrap();
+        assert!(turn.used_untrusted_server_tool);
+        assert_eq!(turn.usage.web_grounded_responses, 1);
+        assert_eq!(turn.usage.web_search_requests, 0);
+    }
+
     #[tokio::test]
     async fn calls_mock_chat_completions_endpoint() {
         let body = test_support::sse_text("gen_mock", "ok");
@@ -229,7 +315,14 @@ mod tests {
         let mut streamed = String::new();
         let mut sink = |delta: &str| streamed.push_str(delta);
         let turn = provider
-            .create_turn(&reqwest::Client::new(), Vec::new(), &mut sink)
+            .create_turn(
+                &reqwest::Client::new(),
+                vec![json!({
+                    "type": "openrouter:web_search",
+                    "parameters": {"max_results": 5}
+                })],
+                &mut sink,
+            )
             .await
             .unwrap();
         assert_eq!(turn.answer.as_deref(), Some("ok"));
@@ -239,5 +332,7 @@ mod tests {
         assert!(requests[0].starts_with("POST /chat/completions "));
         assert!(requests[0].contains("authorization: Bearer test-key"));
         assert!(requests[0].contains("\"stream\":true"));
+        assert!(requests[0].contains("\"type\":\"openrouter:web_search\""));
+        assert!(requests[0].contains("\"max_results\":5"));
     }
 }

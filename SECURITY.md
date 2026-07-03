@@ -29,6 +29,11 @@ from files, filenames, images, Mail, and command output are untrusted.
   keys are removed, output is bounded and tainted, and only sessions started by
   the current Finn process may be resumed. Each session permits at most eight
   resume calls.
+- Explicit web requests may expose OpenRouter's server-side web search and fetch
+  tools to the selected model. Results and fetched page contents are untrusted,
+  bounded external data; detected web-tool use taints the Finn session before
+  local function calls execute. The requests run on OpenRouter infrastructure,
+  not as unrestricted network access from the Mac.
 
 ## Non-guarantees
 
@@ -43,6 +48,8 @@ from files, filenames, images, Mail, and command output are untrusted.
 - Codex CLI remains an autonomous subprocess. Finn reviews completed JSONL
   turns and can resume them, but it does not relay interactive permission
   prompts while a Codex turn is running.
+- OpenRouter web search and fetch are beta provider capabilities whose API,
+  availability, source coverage, and pricing may change independently of Finn.
 - Path canonicalization reduces symlink attacks but does not eliminate every
   possible local time-of-check/time-of-use race.
 - Local malware running as the same macOS user is outside Finn's trust boundary.

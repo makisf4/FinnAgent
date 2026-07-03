@@ -157,6 +157,14 @@ JSONL transcript and session ID, and may make up to eight focused resume calls.
 Codex runs with its `workspace-write` sandbox, provider API keys are removed from
 its environment, and its output is always treated as untrusted data.
 
+Explicit requests to search, browse, research, or fetch online content expose
+OpenRouter's model-independent `web_search` and `web_fetch` server tools to the
+currently selected assistant model. Search is capped at five results per call
+and ten per request; fetch is capped at five uses and 12,000 content tokens.
+OpenRouter executes these tools outside the Mac, and Finn marks their use as
+untrusted external context before any local tool call is considered. Web search
+may incur additional OpenRouter charges.
+
 OpenRouter uses `POST /chat/completions` with OpenAI-compatible function tools,
 and `POST /images` for image-generation models. Transient connection failures, HTTP 429
 responses, and server errors are retried with bounded backoff. Requests have

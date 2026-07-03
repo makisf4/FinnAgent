@@ -21,6 +21,7 @@ pub struct TaskAuthorization {
     allow_trash: bool,
     allow_mail_attachment_save: bool,
     allow_codex: bool,
+    allow_web: bool,
     allow_shell: bool,
     allow_file_write: bool,
     allow_directory_create: bool,
@@ -183,6 +184,31 @@ impl TaskAuthorization {
             "use code cli",
             "run code cli",
         ]);
+        let web_reference = text
+            .has_phrase(&["web", "website", "webpage", "internet", "online", "url"])
+            || text.contains_fragment("http://")
+            || text.contains_fragment("https://");
+        let web_action = text.has_phrase(&[
+            "search",
+            "browse",
+            "look up",
+            "research",
+            "find online",
+            "search online",
+            "search the web",
+            "fetch",
+            "visit",
+            "open the url",
+            "read the url",
+            "read the website",
+        ]);
+        let current_information = text.has_phrase(&[
+            "latest",
+            "current news",
+            "recent news",
+            "today's news",
+            "todays news",
+        ]);
         let write_verb = text.has_phrase(&["write", "create", "save", "make"])
             || text.has_stem(&["γραψ", "δημιουργησ", "φτιαξ", "βαλ"]);
         let file_noun = text.has_phrase(&[
@@ -316,6 +342,8 @@ impl TaskAuthorization {
             allow_mail_attachment_save: transfer_action
                 && (attachment_reference || (mail_object && deictic_reference)),
             allow_codex: codex_object && codex_action,
+            allow_web: (web_reference && web_action)
+                || (current_information && text.has_phrase(&["search", "find", "look up"])),
             allow_shell,
             allow_file_write,
             allow_directory_create,
@@ -539,14 +567,40 @@ pub fn shell_enabled() -> bool {
 /// Execution-time checks remain mandatory because untrusted data can enter the
 /// conversation after the model has already received a tool schema.
 pub fn definitions_for(authorization: TaskAuthorization) -> Vec<Value> {
-    definitions()
+    let mut available = definitions()
         .into_iter()
         .filter(|tool| {
             tool.get("name")
                 .and_then(Value::as_str)
                 .is_some_and(|name| authorization.require_tool(name).is_ok())
         })
-        .collect()
+        .collect::<Vec<_>>();
+    if authorization.allow_web {
+        available.extend(web_server_definitions());
+    }
+    available
+}
+
+fn web_server_definitions() -> [Value; 2] {
+    [
+        json!({
+            "type": "openrouter:web_search",
+            "parameters": {
+                "engine": "auto",
+                "max_results": 5,
+                "max_total_results": 10,
+                "max_characters": 4000
+            }
+        }),
+        json!({
+            "type": "openrouter:web_fetch",
+            "parameters": {
+                "engine": "openrouter",
+                "max_uses": 5,
+                "max_content_tokens": 12000
+            }
+        }),
+    ]
 }
 
 /// Encodes model-visible tool output as data rather than conversational
@@ -1950,6 +2004,27 @@ mod tests {
         assert!(codex_names.contains(&"codex_start"));
         assert!(codex_names.contains(&"codex_resume"));
         assert!(!codex_names.contains(&"run_shell"));
+
+        let web = definitions_for(TaskAuthorization::from_task(
+            "Search the web for current calendar design references",
+        ));
+        assert!(
+            web.iter()
+                .any(|tool| tool["type"].as_str() == Some("openrouter:web_search"))
+        );
+        assert!(
+            web.iter()
+                .any(|tool| tool["type"].as_str() == Some("openrouter:web_fetch"))
+        );
+
+        let no_web = definitions_for(TaskAuthorization::from_task(
+            "Create a local calendar without searching online",
+        ));
+        assert!(no_web.iter().all(|tool| {
+            !tool["type"]
+                .as_str()
+                .is_some_and(|kind| kind.starts_with("openrouter:"))
+        }));
     }
 
     #[test]

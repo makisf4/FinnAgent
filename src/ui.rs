@@ -481,6 +481,18 @@ pub fn render_task_result(result: &TaskResult, reasoning: &str) {
             &format_number(result.task_usage.reasoning_tokens),
         ));
     }
+    if result.task_usage.web_search_requests > 0 || result.task_usage.web_fetch_requests > 0 {
+        extras.push(field(
+            "web",
+            &format!(
+                "{} search + {} fetch",
+                format_number(result.task_usage.web_search_requests),
+                format_number(result.task_usage.web_fetch_requests)
+            ),
+        ));
+    } else if result.task_usage.web_grounded_responses > 0 {
+        extras.push(field("web", "used"));
+    }
     if !result.response_id.is_empty() {
         extras.push(field("response", &short_id(&result.response_id)));
     }

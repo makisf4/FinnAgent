@@ -55,6 +55,7 @@ async fn run() -> Result<()> {
                 "disabled"
             }
         );
+        println!("web: available on explicit requests");
         println!("{key_name}: {key_status}");
         return Ok(());
     }

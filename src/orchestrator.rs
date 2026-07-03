@@ -440,6 +440,7 @@ async fn accumulate_stream(
     let mut content = String::new();
     let mut reasoning = String::new();
     let mut reasoning_details: Vec<Value> = Vec::new();
+    let mut annotations: Vec<Value> = Vec::new();
     let mut tool_calls: Vec<ToolCallAccumulator> = Vec::new();
     let mut usage = Value::Null;
 
@@ -473,6 +474,9 @@ async fn accumulate_stream(
         if let Some(details) = delta.get("reasoning_details").and_then(Value::as_array) {
             reasoning_details.extend(details.iter().cloned());
         }
+        if let Some(items) = delta.get("annotations").and_then(Value::as_array) {
+            annotations.extend(items.iter().cloned());
+        }
         if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
             for call in calls {
                 let index = call.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
@@ -495,6 +499,12 @@ async fn accumulate_stream(
     })
     .await?;
 
+    let source_suffix = citation_suffix(&content, &annotations);
+    if !source_suffix.is_empty() {
+        sink(&source_suffix);
+        content.push_str(&source_suffix);
+    }
+
     let mut message = serde_json::Map::new();
     message.insert("role".to_owned(), Value::String("assistant".to_owned()));
     message.insert(
@@ -513,6 +523,9 @@ async fn accumulate_stream(
             "reasoning_details".to_owned(),
             Value::Array(reasoning_details),
         );
+    }
+    if !annotations.is_empty() {
+        message.insert("annotations".to_owned(), Value::Array(annotations));
     }
     if !tool_calls.is_empty() {
         let calls = tool_calls
@@ -533,6 +546,42 @@ async fn accumulate_stream(
         "choices": [{"message": Value::Object(message)}],
         "usage": usage,
     }))
+}
+
+fn citation_suffix(content: &str, annotations: &[Value]) -> String {
+    let mut sources = Vec::<(String, String)>::new();
+    for annotation in annotations {
+        let citation = annotation.get("url_citation").or_else(|| {
+            (annotation.get("type").and_then(Value::as_str) == Some("url_citation"))
+                .then_some(annotation)
+        });
+        let Some(citation) = citation else {
+            continue;
+        };
+        let Some(url) = citation.get("url").and_then(Value::as_str) else {
+            continue;
+        };
+        if content.contains(url) || sources.iter().any(|(_, existing)| existing == url) {
+            continue;
+        }
+        let title = citation
+            .get("title")
+            .and_then(Value::as_str)
+            .filter(|title| !title.trim().is_empty())
+            .unwrap_or(url)
+            .replace(['[', ']'], "");
+        sources.push((title, url.to_owned()));
+    }
+    if sources.is_empty() {
+        return String::new();
+    }
+    let links = sources
+        .into_iter()
+        .take(10)
+        .map(|(title, url)| format!("- [{title}]({url})"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("\n\nSources:\n{links}")
 }
 
 #[derive(Default)]
@@ -683,6 +732,32 @@ mod tests {
             tier2_model: "z-ai/glm-5v-turbo".to_owned(),
             reasoning_effort: "high".to_owned(),
         }
+    }
+
+    #[test]
+    fn appends_unique_annotation_sources_missing_from_content() {
+        let annotations = vec![
+            json!({
+                "type": "url_citation",
+                "url_citation": {
+                    "url": "https://example.com/article",
+                    "title": "Example [Article]"
+                }
+            }),
+            json!({
+                "type": "url_citation",
+                "url_citation": {
+                    "url": "https://example.com/article",
+                    "title": "Duplicate"
+                }
+            }),
+        ];
+        let suffix = citation_suffix("Grounded answer", &annotations);
+        assert_eq!(
+            suffix,
+            "\n\nSources:\n- [Example Article](https://example.com/article)"
+        );
+        assert!(citation_suffix("See https://example.com/article", &annotations).is_empty());
     }
 
     fn host() -> HostContext {

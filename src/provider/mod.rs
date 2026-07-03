@@ -54,6 +54,7 @@ pub struct ModelTurn {
     pub model: String,
     pub response_id: String,
     pub usage: Usage,
+    pub used_untrusted_server_tool: bool,
     pub tool_calls: Vec<ToolCall>,
     pub answer: Option<String>,
 }
@@ -65,6 +66,9 @@ pub struct Usage {
     pub output_tokens: u64,
     pub reasoning_tokens: u64,
     pub total_tokens: u64,
+    pub web_search_requests: u64,
+    pub web_fetch_requests: u64,
+    pub web_grounded_responses: u64,
 }
 
 pub(super) async fn send_with_retry(request: RequestBuilder, service: &str) -> Result<Response> {
