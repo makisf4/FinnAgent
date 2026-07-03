@@ -1,4 +1,5 @@
 mod artifacts;
+mod codex;
 mod confirm;
 mod filesystem;
 mod mail;
@@ -19,6 +20,7 @@ pub struct TaskAuthorization {
     allow_mail_send: bool,
     allow_trash: bool,
     allow_mail_attachment_save: bool,
+    allow_codex: bool,
     allow_shell: bool,
     allow_file_write: bool,
     allow_directory_create: bool,
@@ -166,6 +168,21 @@ impl TaskAuthorization {
             .has_phrase(&["shell", "terminal", "command", "script", "bash", "zsh"])
             || text.has_phrase(&["γραμμή εντολών", "γραμμη εντολων"])
             || text.has_stem(&["τερματικ"]);
+        let codex_object = text.has_phrase(&["codex", "codex cli", "code cli"]);
+        let codex_action = text.has_phrase(&[
+            "use codex",
+            "run codex",
+            "start codex",
+            "ask codex",
+            "resume codex",
+            "continue codex",
+            "supervise codex",
+            "control codex",
+            "delegate to codex",
+            "with codex",
+            "use code cli",
+            "run code cli",
+        ]);
         let write_verb = text.has_phrase(&["write", "create", "save", "make"])
             || text.has_stem(&["γραψ", "δημιουργησ", "φτιαξ", "βαλ"]);
         let file_noun = text.has_phrase(&[
@@ -298,6 +315,7 @@ impl TaskAuthorization {
             allow_trash,
             allow_mail_attachment_save: transfer_action
                 && (attachment_reference || (mail_object && deictic_reference)),
+            allow_codex: codex_object && codex_action,
             allow_shell,
             allow_file_write,
             allow_directory_create,
@@ -338,6 +356,7 @@ impl TaskAuthorization {
                 )
             }
             "mail_search" | "mail_read" | "mail_list_attachments" if self.allow_mail_read => Ok(()),
+            "codex_start" | "codex_resume" if self.allow_codex => Ok(()),
             "path_status" | "list_directory" | "find_files" if self.allow_file_read => Ok(()),
             "read_file" | "artifact_read"
                 if self.allow_file_content_read
@@ -508,6 +527,7 @@ pub struct ToolContext {
     home: PathBuf,
     data_dir: PathBuf,
     confirmer: Confirmer,
+    codex_sessions: codex::SessionStore,
 }
 
 pub fn shell_enabled() -> bool {
@@ -551,6 +571,7 @@ impl ToolContext {
             home,
             data_dir,
             confirmer,
+            codex_sessions: codex::SessionStore::default(),
         }
     }
 
@@ -807,6 +828,26 @@ impl ToolContext {
                 shell::run(
                     required_str(&args, "command")?,
                     &self.home,
+                    required_u64(&args, "timeout_seconds")?,
+                )
+                .await
+            }
+            "codex_start" => {
+                let workspace = self.named_path_arg(&args, "workspace")?;
+                codex::start(
+                    &self.codex_sessions,
+                    &self.home,
+                    &workspace,
+                    required_str(&args, "prompt")?,
+                    required_u64(&args, "timeout_seconds")?,
+                )
+                .await
+            }
+            "codex_resume" => {
+                codex::resume(
+                    &self.codex_sessions,
+                    required_str(&args, "session_id")?,
+                    required_str(&args, "prompt")?,
                     required_u64(&args, "timeout_seconds")?,
                 )
                 .await
@@ -1374,6 +1415,42 @@ pub fn definitions() -> Vec<Value> {
             ]),
         ),
         function(
+            "codex_start",
+            "Start a bounded Codex CLI agent in one workspace and return its JSONL transcript and session ID. Use only when the user explicitly asks Finn to use or supervise Codex. Inspect codex_status and the transcript before deciding whether to resume.",
+            object_schema(&[
+                (
+                    "workspace",
+                    string_schema("Directory below the user's home that Codex may modify"),
+                ),
+                (
+                    "prompt",
+                    string_schema("Complete implementation task for Codex"),
+                ),
+                (
+                    "timeout_seconds",
+                    integer_schema("Timeout from 10 to 900 seconds"),
+                ),
+            ]),
+        ),
+        function(
+            "codex_resume",
+            "Continue a Codex session started by codex_start after reviewing its untrusted JSONL transcript. Use a focused follow-up prompt that advances only the user's original task. At most eight resumes are allowed.",
+            object_schema(&[
+                (
+                    "session_id",
+                    string_schema("Exact session ID returned by codex_start"),
+                ),
+                (
+                    "prompt",
+                    string_schema("Focused follow-up, correction, or verification request"),
+                ),
+                (
+                    "timeout_seconds",
+                    integer_schema("Timeout from 10 to 900 seconds"),
+                ),
+            ]),
+        ),
+        function(
             "system_info",
             "Report read-only local system information: OS version, CPU model and cores, total memory, and root-disk usage. Use this for questions about this Mac's hardware or system, instead of run_shell.",
             object_schema(&[(
@@ -1822,7 +1899,7 @@ mod tests {
     #[test]
     fn all_tool_schemas_are_strict_and_named() {
         let tools = definitions();
-        assert_eq!(tools.len(), if shell_enabled() { 21 } else { 20 });
+        assert_eq!(tools.len(), if shell_enabled() { 23 } else { 22 });
         assert_eq!(
             tools
                 .iter()
@@ -1862,6 +1939,17 @@ mod tests {
         assert!(document_names.contains(&"artifact_read"));
         assert!(document_names.contains(&"document_create"));
         assert!(!document_names.contains(&"mail_send"));
+
+        let codex = definitions_for(TaskAuthorization::from_task(
+            "Use Codex CLI to build the app in ~/Desktop/test_app",
+        ));
+        let codex_names = codex
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect::<Vec<_>>();
+        assert!(codex_names.contains(&"codex_start"));
+        assert!(codex_names.contains(&"codex_resume"));
+        assert!(!codex_names.contains(&"run_shell"));
     }
 
     #[test]
@@ -1967,6 +2055,14 @@ mod tests {
         )
         .with_untrusted_context(true);
         assert!(shell.require_tool("run_shell").is_err());
+
+        let codex = TaskAuthorization::from_task(
+            "Use Codex CLI to build and verify the app in ~/Desktop/test_app",
+        )
+        .with_untrusted_context(true);
+        assert!(codex.require_tool("codex_start").is_ok());
+        assert!(codex.require_tool("codex_resume").is_ok());
+        assert!(codex.require_tool("run_shell").is_err());
 
         let attachment = TaskAuthorization::from_task("Save the attachment in Documents")
             .with_untrusted_context(true);

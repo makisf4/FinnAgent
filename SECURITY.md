@@ -23,6 +23,12 @@ from files, filenames, images, Mail, and command output are untrusted.
 - Credential paths and resolvable symlinks into protected locations are denied.
 - General shell execution is absent unless `FINN_ENABLE_SHELL=1`; opted-in
   subprocesses skip startup files and receive no provider API keys.
+- Codex delegation is a separate, explicitly authorized capability. Codex runs
+  in `workspace-write` mode inside a non-hidden directory below the user's
+  home; symlink escapes are checked before workspace creation, provider API
+  keys are removed, output is bounded and tainted, and only sessions started by
+  the current Finn process may be resumed. Each session permits at most eight
+  resume calls.
 
 ## Non-guarantees
 
@@ -34,6 +40,9 @@ from files, filenames, images, Mail, and command output are untrusted.
   confirmation gate and execution-time checks are the mitigations, not a proof
   of intent.
 - Opted-in shell execution is not a complete operating-system sandbox.
+- Codex CLI remains an autonomous subprocess. Finn reviews completed JSONL
+  turns and can resume them, but it does not relay interactive permission
+  prompts while a Codex turn is running.
 - Path canonicalization reduces symlink attacks but does not eliminate every
   possible local time-of-check/time-of-use race.
 - Local malware running as the same macOS user is outside Finn's trust boundary.

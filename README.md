@@ -150,6 +150,13 @@ from the model's tools unless `FINN_ENABLE_SHELL=1`; when enabled it requires an
 explicit shell request, skips startup files, and receives a minimal environment
 without provider API keys.
 
+Codex CLI delegation uses separate `codex_start` and `codex_resume` tools rather
+than `run_shell`. When the user explicitly asks Finn to use or supervise Codex,
+Finn starts `codex exec --json` in a workspace below the user's home, reads the
+JSONL transcript and session ID, and may make up to eight focused resume calls.
+Codex runs with its `workspace-write` sandbox, provider API keys are removed from
+its environment, and its output is always treated as untrusted data.
+
 OpenRouter uses `POST /chat/completions` with OpenAI-compatible function tools,
 and `POST /images` for image-generation models. Transient connection failures, HTTP 429
 responses, and server errors are retried with bounded backoff. Requests have
