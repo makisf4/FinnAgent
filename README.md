@@ -165,6 +165,12 @@ OpenRouter executes these tools outside the Mac, and Finn marks their use as
 untrusted external context before any local tool call is considered. Web search
 may incur additional OpenRouter charges.
 
+For tasks that combine research with local work, Finn holds the research answer,
+then starts a local-only continuation round with the authorized filesystem or
+artifact tools. This prevents a model from ending the task after research or
+mistaking OpenRouter's internal server-tool events for client-side function
+calls.
+
 OpenRouter uses `POST /chat/completions` with OpenAI-compatible function tools,
 and `POST /images` for image-generation models. Transient connection failures, HTTP 429
 responses, and server errors are retried with bounded backoff. Requests have

@@ -34,6 +34,10 @@ from files, filenames, images, Mail, and command output are untrusted.
   bounded external data; detected web-tool use taints the Finn session before
   local function calls execute. The requests run on OpenRouter infrastructure,
   not as unrestricted network access from the Mac.
+- Mixed web/local tasks transition to a local-only model round after research.
+  OpenRouter server-tool events are removed from the client function-call loop;
+  local mutations remain limited to capabilities explicitly derived from the
+  original user request.
 
 ## Non-guarantees
 

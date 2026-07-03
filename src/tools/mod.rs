@@ -566,7 +566,15 @@ pub fn shell_enabled() -> bool {
 ///
 /// Execution-time checks remain mandatory because untrusted data can enter the
 /// conversation after the model has already received a tool schema.
+#[cfg(test)]
 pub fn definitions_for(authorization: TaskAuthorization) -> Vec<Value> {
+    definitions_for_turn(authorization, true)
+}
+
+pub fn definitions_for_turn(
+    authorization: TaskAuthorization,
+    include_server_web: bool,
+) -> Vec<Value> {
     let mut available = definitions()
         .into_iter()
         .filter(|tool| {
@@ -575,7 +583,7 @@ pub fn definitions_for(authorization: TaskAuthorization) -> Vec<Value> {
                 .is_some_and(|name| authorization.require_tool(name).is_ok())
         })
         .collect::<Vec<_>>();
-    if authorization.allow_web {
+    if authorization.allow_web && include_server_web {
         available.extend(web_server_definitions());
     }
     available
@@ -2016,6 +2024,28 @@ mod tests {
             web.iter()
                 .any(|tool| tool["type"].as_str() == Some("openrouter:web_fetch"))
         );
+        let local_phase = definitions_for_turn(
+            TaskAuthorization::from_task(
+                "Search the web, then create a directory and write files on my Desktop",
+            )
+            .with_untrusted_context(true),
+            false,
+        );
+        assert!(
+            local_phase
+                .iter()
+                .any(|tool| tool["name"].as_str() == Some("create_directory"))
+        );
+        assert!(
+            local_phase
+                .iter()
+                .any(|tool| tool["name"].as_str() == Some("write_file"))
+        );
+        assert!(local_phase.iter().all(|tool| {
+            !tool["type"]
+                .as_str()
+                .is_some_and(|kind| kind.starts_with("openrouter:"))
+        }));
 
         let no_web = definitions_for(TaskAuthorization::from_task(
             "Create a local calendar without searching online",

@@ -484,11 +484,17 @@ async fn accumulate_stream(
                     tool_calls.push(ToolCallAccumulator::default());
                 }
                 let slot = &mut tool_calls[index];
+                if let Some(kind) = call.get("type").and_then(Value::as_str) {
+                    slot.kind = kind.to_owned();
+                }
                 if let Some(call_id) = call.get("id").and_then(Value::as_str) {
                     slot.id = call_id.to_owned();
                 }
                 if let Some(name) = call.pointer("/function/name").and_then(Value::as_str) {
                     slot.name = name.to_owned();
+                    if slot.kind.is_empty() {
+                        slot.kind = "function".to_owned();
+                    }
                 }
                 if let Some(args) = call.pointer("/function/arguments").and_then(Value::as_str) {
                     slot.arguments.push_str(args);
@@ -530,6 +536,7 @@ async fn accumulate_stream(
     if !tool_calls.is_empty() {
         let calls = tool_calls
             .into_iter()
+            .filter(|call| call.kind == "function" && !call.id.is_empty() && !call.name.is_empty())
             .map(|call| {
                 json!({
                     "id": call.id,
@@ -586,6 +593,7 @@ fn citation_suffix(content: &str, annotations: &[Value]) -> String {
 
 #[derive(Default)]
 struct ToolCallAccumulator {
+    kind: String,
     id: String,
     name: String,
     arguments: String,
@@ -968,11 +976,14 @@ mod tests {
             json!({"id": "gen_s", "choices": [{"delta": {"content": "Hel"}}]}),
             json!({"id": "gen_s", "choices": [{"delta": {"content": "lo"}}]}),
             json!({"id": "gen_s", "choices": [{"delta": {"tool_calls": [{
-                "index": 0, "id": "call_x", "type": "function",
+                "index": 0, "id": "server_search", "type": "openrouter:web_search"
+            }]}}]}),
+            json!({"id": "gen_s", "choices": [{"delta": {"tool_calls": [{
+                "index": 1, "id": "call_x", "type": "function",
                 "function": {"name": "path_status", "arguments": "{\"pa"}
             }]}}]}),
             json!({"id": "gen_s", "choices": [{"delta": {"tool_calls": [{
-                "index": 0, "function": {"arguments": "th\":\"~\"}"}
+                "index": 1, "function": {"arguments": "th\":\"~\"}"}
             }]}}]}),
             json!({"id": "gen_s", "choices": [{"delta": {}, "finish_reason": "tool_calls"}],
                 "usage": {"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5}}),
@@ -995,6 +1006,7 @@ mod tests {
         assert_eq!(streamed, "Hello");
         let message = response.response.pointer("/choices/0/message").unwrap();
         assert_eq!(message["content"], "Hello");
+        assert_eq!(message["tool_calls"].as_array().unwrap().len(), 1);
         assert_eq!(message["tool_calls"][0]["id"], "call_x");
         assert_eq!(
             message["tool_calls"][0]["function"]["arguments"],

@@ -23,6 +23,7 @@ const ROUNDS_PER_BATCH: usize = 12;
 const CALLS_PER_BATCH: u64 = 48;
 const MAX_TASK_TOKENS: u64 = 200_000;
 const MAX_IDENTICAL_TOOL_CALLS: u8 = 2;
+const LOCAL_PHASE_CONTINUATION: &str = "Continue the user's original task now. The requested web research phase is complete. Use the currently available authorized local tools to perform and verify the requested local work. Do not repeat the web research, do not merely describe tool calls, and do not claim local tools are unavailable.";
 
 const INSTRUCTIONS: &str = r#"
 You are Finn, a personal macOS assistant. The user talks to you naturally and expects you to perform tasks on this Mac.
@@ -330,6 +331,7 @@ impl Agent {
         let mut round_budget = ROUNDS_PER_BATCH;
         let mut call_budget = CALLS_PER_BATCH;
         let mut round_index = 0_usize;
+        let mut web_phase_complete = false;
 
         loop {
             if round_index >= round_budget {
@@ -351,7 +353,17 @@ impl Agent {
                 }
             }
             spinner.set_label("Thinking").await;
-            let available_tools = crate::tools::definitions_for(authorization);
+            let available_tools =
+                crate::tools::definitions_for_turn(authorization, !web_phase_complete);
+            let has_server_web = available_tools.iter().any(|tool| {
+                tool.get("type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|kind| kind.starts_with("openrouter:web_"))
+            });
+            let has_local_tools = available_tools
+                .iter()
+                .any(|tool| tool.get("type").and_then(Value::as_str) == Some("function"));
+            let hold_research_output = has_server_web && has_local_tools;
             // Stream assistant text live. The first delta suppresses the spinner
             // and prints the answer header; subsequent deltas append in place.
             let suppressor = spinner.suppressor();
@@ -362,6 +374,9 @@ impl Agent {
                 let suppressor = &suppressor;
                 let quiesced = &quiesced;
                 let mut sink = move |delta: &str| {
+                    if hold_research_output {
+                        return;
+                    }
                     use std::io::Write;
                     if !*streamed {
                         // Ask the animation to stop drawing, then wait until it
@@ -400,6 +415,20 @@ impl Agent {
                 bail!(
                     "Finn stopped after exceeding the per-task budget of {MAX_TASK_TOKENS} tokens."
                 );
+            }
+
+            if model_turn.used_untrusted_server_tool
+                && model_turn.tool_calls.is_empty()
+                && has_local_tools
+                && !web_phase_complete
+            {
+                web_phase_complete = true;
+                self.backend.push_user(LOCAL_PHASE_CONTINUATION);
+                round_index += 1;
+                continue;
+            }
+            if model_turn.used_untrusted_server_tool {
+                web_phase_complete = true;
             }
 
             if !model_turn.tool_calls.is_empty() {
@@ -1048,5 +1077,104 @@ mod tests {
         assert_eq!(result.task_usage.web_search_requests, 1);
         assert!(agent.untrusted_external_context);
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn mixed_web_and_local_task_continues_in_a_local_only_phase() {
+        let directory = tempfile::tempdir().unwrap();
+        let project = directory.path().join("Desktop/calendar");
+        let file = project.join("index.html");
+        let web_response = test_support::sse_body(&[
+            json!({
+                "id": "gen_web",
+                "choices": [{"delta": {
+                    "content": "research complete",
+                    "annotations": [{
+                        "type": "url_citation",
+                        "url_citation": {
+                            "url": "https://example.com/reference",
+                            "title": "Reference"
+                        }
+                    }]
+                }}]
+            }),
+            json!({
+                "id": "gen_web",
+                "choices": [{"delta": {}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3}
+            }),
+        ]);
+        let create_response = test_support::sse_chat(
+            "gen_create",
+            json!({"tool_calls": [{
+                "id": "call_create",
+                "type": "function",
+                "function": {
+                    "name": "create_directory",
+                    "arguments": json!({"path": project.to_string_lossy()}).to_string()
+                }
+            }]}),
+        );
+        let write_response = test_support::sse_chat(
+            "gen_write",
+            json!({"tool_calls": [{
+                "id": "call_write",
+                "type": "function",
+                "function": {
+                    "name": "write_file",
+                    "arguments": json!({
+                        "path": file.to_string_lossy(),
+                        "content": "<h1>calendar</h1>",
+                        "overwrite": false
+                    }).to_string()
+                }
+            }]}),
+        );
+        let final_response = test_support::sse_text("gen_final", "created and verified");
+        let (base_url, server) = test_support::mock_http_server(vec![
+            ("200 OK", web_response),
+            ("200 OK", create_response),
+            ("200 OK", write_response),
+            ("200 OK", final_response),
+        ])
+        .await;
+        let config = Config {
+            api_key: "test-key".to_owned(),
+            base_url,
+            model: "router/test".to_owned(),
+            model_kind: ModelKind::Assistant,
+            vision_model: None,
+            reasoning_effort: "medium".to_owned(),
+            home: directory.path().to_path_buf(),
+            data_dir: directory.path().join("data"),
+        };
+        tokio::fs::create_dir_all(&config.data_dir).await.unwrap();
+        let tools = ToolContext::new(
+            config.home.clone(),
+            config.data_dir.clone(),
+            crate::tools::Confirmer::AutoAllow,
+        );
+        let mut agent = Agent::new(config, tools).unwrap();
+        let task = format!(
+            "Search the web for a design reference, then create the directory {} and write the file index.html on my Desktop",
+            project.display()
+        );
+
+        let result = agent.run_task(&task).await.unwrap();
+        assert_eq!(result.answer, "created and verified");
+        assert_eq!(result.tool_calls, 2);
+        assert_eq!(
+            tokio::fs::read_to_string(&file).await.unwrap(),
+            "<h1>calendar</h1>"
+        );
+        assert!(agent.untrusted_external_context);
+
+        let requests = server.await.unwrap();
+        assert!(requests[0].contains("openrouter:web_search"));
+        assert!(requests[0].contains(r#""name":"create_directory""#));
+        assert!(requests[1].contains(LOCAL_PHASE_CONTINUATION));
+        assert!(!requests[1].contains("openrouter:web_search"));
+        assert!(requests[1].contains(r#""name":"create_directory""#));
+        assert!(requests[1].contains(r#""name":"write_file""#));
     }
 }
