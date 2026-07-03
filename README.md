@@ -14,6 +14,7 @@ Finn does not hand generated commands back to the user. An imperative task is au
 - Inspect, convert, resize, crop, rotate, flip, and grayscale PNG, JPEG, GIF, WEBP, and TIFF images
 - Move exact files and folders to macOS Trash
 - Report read-only system information: OS, CPU, memory, and root-disk usage
+- Search for and download public HTTPS images or files to an exact local path
 - Optionally run explicitly requested Bash/Zsh commands in a secret-free subprocess
 - Search and read Apple Mail messages in Inbox, Trash, Junk, Sent, and Drafts
 - List and save attachments from those Apple Mail messages
@@ -61,6 +62,7 @@ create a DOCX report in ~/Documents and verify its text
 update Summary!B4 in ~/Documents/budget.xlsx to the formula =B2-B3
 rotate page 2 of ~/Downloads/scan.pdf by 90 degrees
 resize ~/Desktop/photo.jpg to 1200 by 800 pixels and save it as PNG
+download a photo of Larry Bird to my Desktop
 ```
 
 Type `/models` during an interactive session to choose a curated OpenRouter
@@ -171,6 +173,14 @@ artifact tools. This prevents a model from ending the task after research or
 mistaking OpenRouter's internal server-tool events for client-side function
 calls.
 
+When the user asks Finn to download an online image or file without supplying a
+direct URL, Finn can search for a suitable source and pass its direct public
+HTTPS URL to the local `download_url` tool. Downloads are capped at 25 MiB,
+follow at most five redirects, reject credentials and private or local network
+addresses, and are written through a temporary file before being moved into
+place. Existing destinations are never replaced unless the original request
+explicitly authorizes overwriting and the interactive confirmation succeeds.
+
 OpenRouter uses `POST /chat/completions` with OpenAI-compatible function tools,
 and `POST /images` for image-generation models. Transient connection failures, HTTP 429
 responses, and server errors are retried with bounded backoff. Requests have
@@ -237,7 +247,8 @@ replacement for Microsoft Word. DOCX text replacement preserves the package but
 matches text within individual Word runs. PDF text replacement works only for
 text represented by supported PDF text operations and fonts. XLSX formulas are
 stored for recalculation by Excel or another spreadsheet application. Animated
-images are currently processed as still images.
+images are currently processed as still images. Public HTTPS downloads have a
+separate 25 MiB limit.
 
 ## Development
 
