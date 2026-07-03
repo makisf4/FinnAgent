@@ -5,6 +5,7 @@ mod filesystem;
 mod mail;
 mod shell;
 mod sysinfo;
+mod web;
 
 use std::env;
 use std::os::unix::fs::PermissionsExt;
@@ -22,6 +23,7 @@ pub struct TaskAuthorization {
     allow_mail_attachment_save: bool,
     allow_codex: bool,
     allow_web: bool,
+    allow_web_download: bool,
     allow_shell: bool,
     allow_file_write: bool,
     allow_directory_create: bool,
@@ -241,6 +243,7 @@ impl TaskAuthorization {
                 "workbook",
                 "image",
                 "images",
+                "phot",
                 "photo",
                 "photos",
                 "png",
@@ -250,6 +253,10 @@ impl TaskAuthorization {
                 "webp",
                 "tiff",
             ]) || text.has_stem(&["έγγρα", "εγγρα", "εικόν", "εικον", "φωτογραφ"]);
+        let web_download = transfer_action
+            && (artifact_reference
+                || file_noun
+                || text.has_phrase(&["from the web", "from the internet", "online"]));
         let artifact_action = text.has_phrase(&[
             "create",
             "edit",
@@ -343,7 +350,9 @@ impl TaskAuthorization {
                 && (attachment_reference || (mail_object && deictic_reference)),
             allow_codex: codex_object && codex_action,
             allow_web: (web_reference && web_action)
+                || web_download
                 || (current_information && text.has_phrase(&["search", "find", "look up"])),
+            allow_web_download: web_download,
             allow_shell,
             allow_file_write,
             allow_directory_create,
@@ -399,6 +408,7 @@ impl TaskAuthorization {
             }
             "run_shell" if self.allow_shell => Ok(()),
             "system_info" if self.allow_system_info => Ok(()),
+            "download_url" if self.allow_web_download => Ok(()),
             "write_file" if self.allow_file_write => Ok(()),
             "create_directory" if self.allow_directory_create => Ok(()),
             "document_create"
@@ -915,6 +925,24 @@ impl ToolContext {
                 .await
             }
             "system_info" => sysinfo::report(required_str(&args, "section")?).await,
+            "download_url" => {
+                let destination = self.path_arg(&args)?;
+                filesystem::ensure_not_sensitive(&destination, &self.home)?;
+                authorization.require_write_path(&destination, &self.home)?;
+                authorization.require_overwrite(required_bool(&args, "overwrite")?)?;
+                self.confirm_overwrite(
+                    "download_url",
+                    required_bool(&args, "overwrite")?,
+                    &destination,
+                )
+                .await?;
+                web::download_url(
+                    required_str(&args, "url")?,
+                    &destination,
+                    required_bool(&args, "overwrite")?,
+                )
+                .await
+            }
             "mail_search" => {
                 mail::search(
                     required_str(&args, "query")?,
@@ -1524,6 +1552,24 @@ pub fn definitions() -> Vec<Value> {
             )]),
         ),
         function(
+            "download_url",
+            "Download one public HTTPS URL to an exact local file path. Use web search first when the user describes an online file or image but does not provide its direct URL.",
+            object_schema(&[
+                (
+                    "url",
+                    string_schema("Direct public HTTPS file or image URL"),
+                ),
+                (
+                    "path",
+                    string_schema("Exact destination file path, including file name"),
+                ),
+                (
+                    "overwrite",
+                    boolean_schema("Whether an existing destination file may be replaced"),
+                ),
+            ]),
+        ),
+        function(
             "mail_search",
             "Search an Apple Mail mailbox by sender or subject and return message IDs and attachment counts.",
             object_schema(&[
@@ -1722,6 +1768,7 @@ mod tests {
         FileContentRead,
         MailRead,
         SystemInfo,
+        WebDownload,
     }
 
     impl Cap {
@@ -1739,6 +1786,7 @@ mod tests {
                 Cap::FileContentRead => auth.allow_file_content_read,
                 Cap::MailRead => auth.allow_mail_read,
                 Cap::SystemInfo => auth.allow_system_info,
+                Cap::WebDownload => auth.allow_web_download,
             }
         }
     }
@@ -1786,6 +1834,11 @@ mod tests {
                 "Write a zsh script on my Desktop that reports the ten largest files",
                 &[FileWrite],
                 &[MailSend, Trash, DirCreate],
+            ),
+            (
+                "download o phot of larry bird on the Desktop",
+                &[FileRead, WebDownload],
+                &[MailSend, Trash, Shell],
             ),
             (
                 "Create 12 folders on my Desktop named January through December. Inside each folder, create 7 empty TXT files named Monday.txt through Sunday.txt.",
@@ -1961,7 +2014,7 @@ mod tests {
     #[test]
     fn all_tool_schemas_are_strict_and_named() {
         let tools = definitions();
-        assert_eq!(tools.len(), if shell_enabled() { 23 } else { 22 });
+        assert_eq!(tools.len(), if shell_enabled() { 24 } else { 23 });
         assert_eq!(
             tools
                 .iter()
@@ -2012,6 +2065,20 @@ mod tests {
         assert!(codex_names.contains(&"codex_start"));
         assert!(codex_names.contains(&"codex_resume"));
         assert!(!codex_names.contains(&"run_shell"));
+
+        let download = definitions_for(TaskAuthorization::from_task(
+            "download o phot of larry bird on the Desktop",
+        ));
+        assert!(
+            download
+                .iter()
+                .any(|tool| tool["name"].as_str() == Some("download_url"))
+        );
+        assert!(
+            download
+                .iter()
+                .any(|tool| tool["type"].as_str() == Some("openrouter:web_search"))
+        );
 
         let web = definitions_for(TaskAuthorization::from_task(
             "Search the web for current calendar design references",
