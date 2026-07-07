@@ -394,7 +394,11 @@ impl TaskAuthorization {
             }
             "mail_search" | "mail_read" | "mail_list_attachments" if self.allow_mail_read => Ok(()),
             "codex_start" | "codex_resume" if self.allow_codex => Ok(()),
-            "path_status" | "list_directory" | "find_files" if self.allow_file_read => Ok(()),
+            "path_status" | "list_directory" | "find_files" | "find_large_files"
+                if self.allow_file_read =>
+            {
+                Ok(())
+            }
             "read_file" | "artifact_read"
                 if self.allow_file_content_read
                     && (!self.untrusted_context || self.authorized_attachment_count > 0) =>
@@ -721,6 +725,17 @@ impl ToolContext {
                     &path,
                     required_str(&args, "query")?,
                     required_u64(&args, "max_depth")? as usize,
+                    required_u64(&args, "limit")? as usize,
+                )
+                .await
+            }
+            "find_large_files" => {
+                let path = self.path_arg(&args)?;
+                filesystem::ensure_not_sensitive(&path, &self.home)?;
+                authorization.require_read_path(&path, &self.home, false)?;
+                filesystem::find_large_files(
+                    &path,
+                    required_u64(&args, "min_size_mb")?,
                     required_u64(&args, "limit")? as usize,
                 )
                 .await
@@ -1319,6 +1334,18 @@ pub fn definitions() -> Vec<Value> {
                 (
                     "max_depth",
                     integer_schema("Maximum traversal depth, from 1 to 20"),
+                ),
+                ("limit", integer_schema("Maximum matches, from 1 to 500")),
+            ]),
+        ),
+        function(
+            "find_large_files",
+            "Recursively find regular files larger than a size threshold, sorted largest first. Use for requests like finding files bigger than 300 MB.",
+            object_schema(&[
+                ("path", string_schema("Root directory to search")),
+                (
+                    "min_size_mb",
+                    integer_schema("Minimum file size in MiB; files must be larger than this"),
                 ),
                 ("limit", integer_schema("Maximum matches, from 1 to 500")),
             ]),
@@ -2014,7 +2041,7 @@ mod tests {
     #[test]
     fn all_tool_schemas_are_strict_and_named() {
         let tools = definitions();
-        assert_eq!(tools.len(), if shell_enabled() { 24 } else { 23 });
+        assert_eq!(tools.len(), if shell_enabled() { 25 } else { 24 });
         assert_eq!(
             tools
                 .iter()

@@ -194,6 +194,49 @@ pub async fn find_files(
     .await?
 }
 
+pub async fn find_large_files(root: &Path, min_size_mb: u64, limit: usize) -> Result<String> {
+    let root = root.to_path_buf();
+    let min_size_bytes = min_size_mb.clamp(1, 1_048_576).saturating_mul(1_048_576);
+    let limit = limit.clamp(1, 500);
+
+    tokio::task::spawn_blocking(move || {
+        if !root.is_dir() {
+            bail!("search root is not a directory: {}", root.display());
+        }
+        let mut matches = Vec::new();
+        for entry in WalkDir::new(&root)
+            .follow_links(false)
+            .into_iter()
+            .filter_map(Result::ok)
+        {
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            let size = metadata.len();
+            if size > min_size_bytes {
+                matches.push((size, entry.path().to_path_buf()));
+            }
+        }
+        matches.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+        matches.truncate(limit);
+        Ok(if matches.is_empty() {
+            "no matches".to_owned()
+        } else {
+            matches
+                .into_iter()
+                .map(|(size, path)| {
+                    format!("{:.1} MiB\t{}", size as f64 / 1_048_576.0, path.display())
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+    })
+    .await?
+}
+
 pub async fn read_file(path: &Path, max_bytes: usize) -> Result<String> {
     let max_bytes = max_bytes.clamp(1, 1_000_000);
     let bytes = tokio::fs::read(path)
@@ -343,6 +386,29 @@ mod tests {
 
         let result = find_files(temp.path(), "invoice", 5, 10).await.unwrap();
         assert!(result.contains("invoice-june.pdf"));
+    }
+
+    #[tokio::test]
+    async fn finds_large_files_sorted_largest_first() {
+        let temp = tempfile::tempdir().unwrap();
+        let small = temp.path().join("small.bin");
+        let medium = temp.path().join("medium.bin");
+        let large = temp.path().join("large.bin");
+        tokio::fs::write(&small, vec![0_u8; 512 * 1024])
+            .await
+            .unwrap();
+        tokio::fs::write(&medium, vec![0_u8; 2 * 1024 * 1024])
+            .await
+            .unwrap();
+        tokio::fs::write(&large, vec![0_u8; 3 * 1024 * 1024])
+            .await
+            .unwrap();
+
+        let result = find_large_files(temp.path(), 1, 10).await.unwrap();
+        let large_index = result.find("large.bin").unwrap();
+        let medium_index = result.find("medium.bin").unwrap();
+        assert!(large_index < medium_index);
+        assert!(!result.contains("small.bin"));
     }
 
     #[tokio::test]

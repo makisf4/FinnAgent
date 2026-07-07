@@ -430,8 +430,9 @@ fn is_user_message(message: &Message) -> bool {
 }
 
 /// Reassembles a non-streaming Chat Completions response object from an SSE
-/// stream, forwarding assistant content deltas to `sink` as they arrive. Tool
-/// calls stream as indexed fragments whose `arguments` are concatenated.
+/// stream. Assistant content is forwarded to `sink` only after the complete
+/// message is known, so text-form pseudo tool calls are not leaked as answers.
+/// Tool calls stream as indexed fragments whose `arguments` are concatenated.
 async fn accumulate_stream(
     response: reqwest::Response,
     sink: crate::provider::TextSink<'_>,
@@ -462,7 +463,6 @@ async fn accumulate_stream(
         };
         if let Some(text) = delta.get("content").and_then(Value::as_str) {
             content.push_str(text);
-            sink(text);
         }
         if let Some(text) = delta
             .get("reasoning")
@@ -507,10 +507,14 @@ async fn accumulate_stream(
 
     let source_suffix = citation_suffix(&content, &annotations);
     if !source_suffix.is_empty() {
-        sink(&source_suffix);
         content.push_str(&source_suffix);
     }
 
+    let should_sink_content =
+        !content.is_empty() && !content.contains("<｜DSML｜tool_calls>") && tool_calls.is_empty();
+    if should_sink_content {
+        sink(&content);
+    }
     let mut message = serde_json::Map::new();
     message.insert("role".to_owned(), Value::String("assistant".to_owned()));
     message.insert(
@@ -547,7 +551,6 @@ async fn accumulate_stream(
             .collect::<Vec<_>>();
         message.insert("tool_calls".to_owned(), Value::Array(calls));
     }
-
     Ok(json!({
         "id": id,
         "choices": [{"message": Value::Object(message)}],
@@ -969,9 +972,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn streams_text_deltas_and_reassembles_tool_calls() {
-        // A turn that streams two text deltas and a tool call whose arguments
-        // arrive in fragments across several events.
+    async fn withholds_text_deltas_and_reassembles_tool_calls() {
+        // A turn that receives two text deltas and a tool call whose arguments
+        // arrive in fragments across several events. Text is kept in history
+        // but not streamed visibly when the same message contains tool calls.
         let events = test_support::sse_body(&[
             json!({"id": "gen_s", "choices": [{"delta": {"content": "Hel"}}]}),
             json!({"id": "gen_s", "choices": [{"delta": {"content": "lo"}}]}),
@@ -1003,7 +1007,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(streamed, "Hello");
+        assert_eq!(streamed, "");
         let message = response.response.pointer("/choices/0/message").unwrap();
         assert_eq!(message["content"], "Hello");
         assert_eq!(message["tool_calls"].as_array().unwrap().len(), 1);

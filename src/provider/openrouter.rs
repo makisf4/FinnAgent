@@ -106,7 +106,7 @@ fn parse_response(response: &Value) -> Result<ModelTurn> {
         .pointer("/choices/0/message")
         .and_then(Value::as_object)
         .context("OpenRouter response did not contain choices[0].message")?;
-    let tool_calls = match message.get("tool_calls") {
+    let mut tool_calls = match message.get("tool_calls") {
         None | Some(Value::Null) => Vec::new(),
         Some(Value::Array(calls)) => calls
             .iter()
@@ -114,11 +114,18 @@ fn parse_response(response: &Value) -> Result<ModelTurn> {
             .collect::<Result<Vec<_>>>()?,
         Some(_) => bail!("OpenRouter tool-call format mismatch: tool_calls must be an array"),
     };
-    let answer = message
+    let mut answer = message
         .get("content")
         .and_then(Value::as_str)
         .filter(|text| !text.is_empty())
         .map(str::to_owned);
+    if tool_calls.is_empty()
+        && let Some(content) = answer.as_deref()
+        && let Some(dsml_calls) = parse_dsml_tool_calls(content)?
+    {
+        tool_calls = dsml_calls;
+        answer = None;
+    }
     let usage = response.get("usage").unwrap_or(&Value::Null);
     let server_tool_use = usage.get("server_tool_use").unwrap_or(&Value::Null);
     let web_search_requests = server_tool_use
@@ -191,6 +198,92 @@ fn parse_tool_call(call: &Value) -> Result<ToolCall> {
     })
 }
 
+fn parse_dsml_tool_calls(content: &str) -> Result<Option<Vec<ToolCall>>> {
+    if !content.contains("<｜DSML｜tool_calls>") {
+        return Ok(None);
+    }
+
+    let mut calls = Vec::new();
+    let mut remaining = content;
+    while let Some(start) = remaining.find("<｜DSML｜invoke") {
+        remaining = &remaining[start..];
+        let header_end = remaining
+            .find('>')
+            .context("OpenRouter DSML tool-call format mismatch: unterminated invoke tag")?;
+        let header = &remaining[..header_end + 1];
+        let name = attribute_value(header, "name")
+            .context("OpenRouter DSML tool-call format mismatch: missing invoke name")?;
+        let close = "</｜DSML｜invoke>";
+        let body_start = header_end + 1;
+        let body_end = remaining[body_start..]
+            .find(close)
+            .map(|index| body_start + index)
+            .context("OpenRouter DSML tool-call format mismatch: unterminated invoke body")?;
+        let body = &remaining[body_start..body_end];
+        let mut arguments = Map::new();
+        let mut body_remaining = body;
+        while let Some(param_start) = body_remaining.find("<｜DSML｜parameter") {
+            body_remaining = &body_remaining[param_start..];
+            let param_header_end = body_remaining
+                .find('>')
+                .context("OpenRouter DSML tool-call format mismatch: unterminated parameter tag")?;
+            let param_header = &body_remaining[..param_header_end + 1];
+            let param_name = attribute_value(param_header, "name")
+                .context("OpenRouter DSML tool-call format mismatch: missing parameter name")?;
+            let param_close = "</｜DSML｜parameter>";
+            let value_start = param_header_end + 1;
+            let value_end = body_remaining[value_start..]
+                .find(param_close)
+                .map(|index| value_start + index)
+                .context("OpenRouter DSML tool-call format mismatch: unterminated parameter")?;
+            let value = decode_xml_entities(&body_remaining[value_start..value_end]);
+            arguments.insert(param_name, Value::String(value));
+            body_remaining = &body_remaining[value_end + param_close.len()..];
+        }
+        normalize_dsml_arguments(&name, &mut arguments);
+        calls.push(ToolCall {
+            id: format!("dsml_call_{}", calls.len() + 1),
+            name,
+            arguments: Value::Object(arguments).to_string(),
+        });
+        remaining = &remaining[body_end + close.len()..];
+    }
+
+    if calls.is_empty() {
+        bail!("OpenRouter DSML tool-call format mismatch: no invoke blocks found");
+    }
+    Ok(Some(calls))
+}
+
+fn normalize_dsml_arguments(name: &str, arguments: &mut Map<String, Value>) {
+    if name == "run_shell" {
+        if !arguments.contains_key("command")
+            && let Some(command) = arguments.remove("cmd")
+        {
+            arguments.insert("command".to_owned(), command);
+        }
+        arguments
+            .entry("timeout_seconds".to_owned())
+            .or_insert(Value::Number(120_u64.into()));
+    }
+}
+
+fn attribute_value(tag: &str, name: &str) -> Option<String> {
+    let needle = format!("{name}=\"");
+    let start = tag.find(&needle)? + needle.len();
+    let end = tag[start..].find('"')? + start;
+    Some(decode_xml_entities(&tag[start..end]))
+}
+
+fn decode_xml_entities(value: &str) -> String {
+    value
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -222,6 +315,26 @@ mod tests {
         assert_eq!(turn.tool_calls[0].name, "path_status");
         assert_eq!(turn.usage.total_tokens, 15);
         assert!(turn.model.is_empty());
+    }
+
+    #[test]
+    fn parses_deepseek_dsml_tool_call_content() {
+        let response = json!({
+            "id": "gen-dsml",
+            "choices": [{"message": {
+                "role": "assistant",
+                "content": "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"run_shell\">\n<｜DSML｜parameter name=\"cmd\" string=\"true\">find ~ -type f -size +300M 2&gt;/dev/null</｜DSML｜parameter>\n<｜DSML｜parameter name=\"description\" string=\"true\">Find files larger than 300MB</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>"
+            }}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+        });
+        let turn = parse_response(&response).unwrap();
+        assert!(turn.answer.is_none());
+        assert_eq!(turn.tool_calls.len(), 1);
+        assert_eq!(turn.tool_calls[0].id, "dsml_call_1");
+        assert_eq!(turn.tool_calls[0].name, "run_shell");
+        let args: Value = serde_json::from_str(&turn.tool_calls[0].arguments).unwrap();
+        assert_eq!(args["command"], "find ~ -type f -size +300M 2>/dev/null");
+        assert_eq!(args["timeout_seconds"], 120);
     }
 
     #[test]
