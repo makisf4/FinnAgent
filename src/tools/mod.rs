@@ -445,6 +445,8 @@ impl ParsedIntent {
             "without deleting",
         ]) || text.has_phrase(&["μη"])
             && text.has_stem(&["διαγρα", "σβήσ", "σβησ"]);
+        let delete_negated = delete_negated
+            || (delete_action && text.has_phrase(&["do not", "don't", "dont", "never", "without"]));
         let artifact_suboperation = artifact_page_or_image_suboperation(&text);
         let filesystem_target = text.has_phrase(&[
             "file",
@@ -607,6 +609,16 @@ impl ParsedIntent {
                         "αντικατάστ",
                         "αντικαταστ",
                     ])));
+        let overwrite = overwrite
+            && !text.has_phrase(&[
+                "do not overwrite",
+                "don't overwrite",
+                "dont overwrite",
+                "without overwriting",
+                "never overwrite",
+            ])
+            && !(text.has_phrase(&["do not", "don't", "dont", "never", "without"])
+                && text.has_phrase(&["overwrite"]));
         let system_info = text.has_phrase(&[
             "system",
             "cpu",
@@ -2015,6 +2027,11 @@ mod tests {
                 "Read it but do not delete anything",
                 &[],
                 &[Trash, MailSend, Shell],
+            ),
+            (
+                "Read the note but do not send email, delete files, or overwrite anything",
+                &[FileRead],
+                &[Trash, MailSend, Shell, Overwrite],
             ),
             // Mail reading vs sending.
             (
