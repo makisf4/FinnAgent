@@ -1,6 +1,8 @@
 mod agent;
 mod catalog;
 mod config;
+#[cfg(test)]
+mod evals;
 mod input;
 mod markdown;
 mod orchestrator;

@@ -21,6 +21,7 @@ Finn does not hand generated commands back to the user. An imperative task is au
 - Send email with file attachments through Apple Mail when explicitly requested
 - Preserve conversation context during the running session
 - Optionally record completed task summaries locally
+- Include task-level and per-tool authorization summaries in opted-in local task logs
 - Show a live activity indicator while thinking or running tools, then a per-task summary of model, reasoning effort, tool activity, API rounds, elapsed time, and real token usage
 - Stream the answer live as it is generated, and render Markdown (bold, code, lists) in the final reply
 - Work in batches: if a long task reaches the step budget without finishing, an interactive session asks whether to keep going instead of failing outright
@@ -207,6 +208,13 @@ File deletion uses Trash. Rust independently checks authorization for shell
 execution, filesystem and artifact writes, email sending, attachment saving,
 overwriting, and moving items to Trash; model instructions alone cannot grant
 those capabilities.
+
+When `FINN_TASK_LOG` is enabled, each task record includes a structured
+authorization snapshot: derived capabilities, bound recipient/attachment counts,
+standard locations named by the user, untrusted-context state, and the tool
+schemas exposed for the initial model round. Each recorded tool event also
+includes its status, denial detail when applicable, and whether interactive
+confirmation was required.
 
 Each API round receives only the tool schemas authorized by the current user
 request. The exposed set contracts after untrusted data enters the conversation,

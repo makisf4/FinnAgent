@@ -138,13 +138,15 @@ impl Agent {
         }
         let authorization = TaskAuthorization::from_task(task)
             .with_untrusted_context(self.untrusted_external_context);
+        let authorization_snapshot = authorization.audit_snapshot(true);
         let checkpoint = self.backend.checkpoint();
         self.backend.push_user(task);
         let result = self.complete_task(task, authorization).await;
         if result.is_err() {
             self.backend = checkpoint;
             if let Err(error) = &result {
-                self.append_failure_log(task, error).await;
+                self.append_failure_log(task, error, authorization_snapshot)
+                    .await;
             }
         }
         result
@@ -164,17 +166,15 @@ impl Agent {
         }
         let checkpoint = self.backend.checkpoint();
         self.backend.push_user_image(prompt, data_url);
-        let result = self
-            .complete_task(
-                log_task,
-                TaskAuthorization::default()
-                    .with_untrusted_context(self.untrusted_external_context),
-            )
-            .await;
+        let authorization =
+            TaskAuthorization::default().with_untrusted_context(self.untrusted_external_context);
+        let authorization_snapshot = authorization.audit_snapshot(true);
+        let result = self.complete_task(log_task, authorization).await;
         if result.is_err() {
             self.backend = checkpoint;
             if let Err(error) = &result {
-                self.append_failure_log(log_task, error).await;
+                self.append_failure_log(log_task, error, authorization_snapshot)
+                    .await;
             }
         }
         result
@@ -197,6 +197,13 @@ impl Agent {
                 "provider": "openrouter",
                 "model": self.config.model,
                 "task": prompt,
+                "authorization": {
+                    "source": "image_generation_prompt",
+                    "untrusted_context": self.untrusted_external_context,
+                    "capabilities": {},
+                    "bindings": {},
+                    "exposed_tools": [],
+                },
                 "result": answer,
                 "tool_calls": [],
                 "api_rounds": 1,
@@ -321,6 +328,7 @@ impl Agent {
         mut authorization: TaskAuthorization,
         spinner: &ui::Spinner,
     ) -> Result<TaskResult> {
+        let authorization_snapshot = authorization.audit_snapshot(true);
         let started_at = Instant::now();
         let mut task_usage = Usage::default();
         let mut tool_calls = 0_u64;
@@ -465,6 +473,7 @@ impl Agent {
                         .await;
                     let pauses_for_confirmation =
                         tool_may_request_confirmation(&call.name, &call.arguments);
+                    let untrusted_before_tool = authorization.untrusted_context_active();
                     if pauses_for_confirmation {
                         spinner.pause_for_prompt().await;
                     }
@@ -502,6 +511,12 @@ impl Agent {
                         "name": call.name,
                         "status": status,
                         "detail": detail,
+                        "authorization": {
+                            "decision": if status == "denied" { "denied" } else { "allowed" },
+                            "source": "current_user_task",
+                            "untrusted_context": untrusted_before_tool,
+                            "confirmation_required": pauses_for_confirmation,
+                        },
                     }));
                     self.backend.push_tool_result(
                         &call.id,
@@ -530,6 +545,7 @@ impl Agent {
                     "provider": "openrouter",
                     "model": last_model,
                     "task": task,
+                    "authorization": authorization_snapshot,
                     "result": answer,
                     "tool_calls": tool_names,
                     "tool_events": tool_events,
@@ -605,7 +621,7 @@ impl Agent {
         self.turn = checkpoint.turn;
     }
 
-    async fn append_failure_log(&self, task: &str, error: &anyhow::Error) {
+    async fn append_failure_log(&self, task: &str, error: &anyhow::Error, authorization: Value) {
         let _ = self
             .tools
             .append_task_record(&json!({
@@ -614,6 +630,7 @@ impl Agent {
                 "provider": "openrouter",
                 "model": self.config.model,
                 "task": task,
+                "authorization": authorization,
                 "error": format!("{error:#}"),
             }))
             .await;
