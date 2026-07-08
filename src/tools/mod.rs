@@ -41,335 +41,66 @@ pub struct TaskAuthorization {
     untrusted_context: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct CapabilitySet {
+    mail_send: bool,
+    trash: bool,
+    mail_attachment_save: bool,
+    codex: bool,
+    web: bool,
+    web_download: bool,
+    shell: bool,
+    file_write: bool,
+    directory_create: bool,
+    artifact_write: bool,
+    overwrite: bool,
+    file_read: bool,
+    file_content_read: bool,
+    mail_read: bool,
+    system_info: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct AuthorizationBindings {
+    recipient_hashes: [u64; 4],
+    recipient_count: u8,
+    attachment_hashes: [u64; 8],
+    attachment_count: u8,
+    location_flags: u8,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ParsedIntent {
+    capabilities: CapabilitySet,
+    bindings: AuthorizationBindings,
+}
+
 impl TaskAuthorization {
     pub fn from_task(task: &str) -> Self {
-        let text = TaskText::new(task);
-        let raw = text.raw();
-
-        let mail_object = text
-            .has_phrase(&["email", "emails", "mail", "mails", "message", "messages"])
-            || text.has_stem(&["μήνυμ", "μηνυμ"]);
-        let send_action = text.has_phrase(&[
-            "send",
-            "forward",
-            "reply",
-            "email me",
-            "email it",
-            "email this",
-            "email that",
-            "email the",
-            "email a",
-            "mail me",
-            "mail it",
-            "mail this",
-            "mail that",
-            "mail the",
-            "mail a",
-        ]) || text.has_stem(&[
-            "στείλ",
-            "στειλ",
-            "προώθησ",
-            "προωθησ",
-            "απάντησ",
-            "απαντησ",
-            "αποστολ",
-        ]) || text.starts_with_word("email")
-            || text.starts_with_word("mail");
-        let send_negated = text.has_phrase(&[
-            "do not send",
-            "don't send",
-            "dont send",
-            "without sending",
-            "never send",
-            "do not forward",
-            "don't forward",
-            "dont forward",
-            "do not reply",
-            "don't reply",
-            "dont reply",
-        ]) || text.has_phrase(&["μη"]) && text.has_stem(&["στείλ", "στειλ"])
-            || text.has_phrase(&["χωρίς", "χωρις"]) && text.has_stem(&["αποστολ"]);
-        let transfer_action = text.has_phrase(&[
-            "save", "copy", "download", "extract", "move", "put", "store", "βάλε", "βαλε",
-        ]) || text.has_stem(&[
-            "αποθήκευσ",
-            "αποθηκευσ",
-            "αντιγρα",
-            "κατέβασ",
-            "κατεβασ",
-            "μετακίνησ",
-            "μετακινησ",
-        ]);
-        let attachment_reference = text.has_phrase(&["attachment", "attachments", "attached"])
-            || text.has_stem(&["συνημμ", "επισυναπτ"]);
-        // Deictic references ("it", "that", "this") only imply an attachment
-        // when the task also mentions mail; otherwise they collide constantly.
-        let deictic_reference = text.has_phrase(&["it", "that", "this"]);
-        let read_action = text.has_phrase(&[
-            "read", "search", "find", "check", "look", "show", "list", "inspect", "βρες",
-        ]) || text.has_stem(&[
-            "summar",
-            "analy",
-            "διάβασ",
-            "διαβασ",
-            "ψάξ",
-            "ψαξ",
-            "δείξ",
-            "δειξ",
-            "έλεγξ",
-            "ελεγξ",
-        ]);
-        let explicit_trash_action = text.has_phrase(&[
-            "move to trash",
-            "move it to trash",
-            "move that to trash",
-            "move this to trash",
-            "to trash",
-            "to the trash",
-            "trash the",
-            "trash this",
-            "trash that",
-            "into trash",
-            "into the trash",
-            "βάλε στον κάδο",
-            "βαλε στον καδο",
-            "μετακίνησε στον κάδο",
-            "μετακινησε στον καδο",
-        ]);
-        let delete_action =
-            text.has_phrase(&["delete", "remove"]) || text.has_stem(&["διαγρα", "σβήσ", "σβησ"]);
-        let delete_negated = text.has_phrase(&[
-            "do not delete",
-            "don't delete",
-            "dont delete",
-            "do not remove",
-            "don't remove",
-            "dont remove",
-            "without deleting",
-        ]) || text.has_phrase(&["μη"])
-            && text.has_stem(&["διαγρα", "σβήσ", "σβησ"]);
-        let artifact_suboperation = artifact_page_or_image_suboperation(&text);
-        let filesystem_target = text.has_phrase(&[
-            "file",
-            "files",
-            "folder",
-            "folders",
-            "directory",
-            "directories",
-            "path",
-            "desktop",
-            "documents",
-            "downloads",
-        ]) || text.has_stem(&["αρχεί", "αρχει", "φάκελ", "φακελ"])
-            || text.contains_fragment("~/")
-            || text.contains_fragment("/users/")
-            || text.has_file_extension();
-        let allow_trash = (explicit_trash_action
-            || (delete_action && !artifact_suboperation && filesystem_target))
-            && !delete_negated;
-        let allow_shell = text
-            .has_phrase(&["shell", "terminal", "command", "script", "bash", "zsh"])
-            || text.has_phrase(&["γραμμή εντολών", "γραμμη εντολων"])
-            || text.has_stem(&["τερματικ"]);
-        let codex_object = text.has_phrase(&["codex", "codex cli", "code cli"]);
-        let codex_action = text.has_phrase(&[
-            "use codex",
-            "run codex",
-            "start codex",
-            "ask codex",
-            "resume codex",
-            "continue codex",
-            "supervise codex",
-            "control codex",
-            "delegate to codex",
-            "with codex",
-            "use code cli",
-            "run code cli",
-        ]);
-        let web_reference = text
-            .has_phrase(&["web", "website", "webpage", "internet", "online", "url"])
-            || text.contains_fragment("http://")
-            || text.contains_fragment("https://");
-        let web_action = text.has_phrase(&[
-            "search",
-            "browse",
-            "look up",
-            "research",
-            "find online",
-            "search online",
-            "search the web",
-            "fetch",
-            "visit",
-            "open the url",
-            "read the url",
-            "read the website",
-        ]);
-        let current_information = text.has_phrase(&[
-            "latest",
-            "current news",
-            "recent news",
-            "today's news",
-            "todays news",
-        ]);
-        let write_verb = text.has_phrase(&["write", "create", "save", "make"])
-            || text.has_stem(&["γραψ", "δημιουργησ", "φτιαξ", "βαλ"]);
-        let file_noun = text.has_phrase(&[
-            "file",
-            "files",
-            "report",
-            "reports",
-            "summary",
-            "summaries",
-            "note",
-            "notes",
-            "script",
-            "scripts",
-            "txt",
-        ]) || text.has_stem(&["αρχε"])
-            || text.has_file_extension();
-        let allow_file_write = write_verb && file_noun;
-        let allow_directory_create = ((text.has_phrase(&["create", "make"]))
-            && text.has_phrase(&["folder", "directory"]))
-            || (text.has_stem(&["δημιούργησ", "δημιουργησ", "φτιάξ", "φτιαξ"])
-                && text.has_stem(&["φάκελ", "φακελ"]));
-        let artifact_reference =
-            text.has_phrase(&[
-                "docx",
-                "document",
-                "documents",
-                "pdf",
-                "xlsx",
-                "spreadsheet",
-                "workbook",
-                "image",
-                "images",
-                "phot",
-                "photo",
-                "photos",
-                "png",
-                "jpg",
-                "jpeg",
-                "gif",
-                "webp",
-                "tiff",
-            ]) || text.has_stem(&["έγγρα", "εγγρα", "εικόν", "εικον", "φωτογραφ"]);
-        let web_download = transfer_action
-            && (artifact_reference
-                || file_noun
-                || text.has_phrase(&["from the web", "from the internet", "online"]));
-        let artifact_action = text.has_phrase(&[
-            "create",
-            "edit",
-            "update",
-            "replace",
-            "resize",
-            "crop",
-            "rotate",
-            "convert",
-            "grayscale",
-        ]) || text.has_phrase(&["remove page", "remove pages"])
-            || text.has_stem(&[
-                "δημιούργησ",
-                "δημιουργησ",
-                "επεξεργ",
-                "ενημέρωσ",
-                "ενημερωσ",
-                "αντικατάστ",
-                "αντικαταστ",
-                "περιστρ",
-                "μετατροπ",
-            ]);
-        let conversational_mail_action = text.has_phrase(&["forward", "reply"])
-            || text.has_stem(&["προώθησ", "προωθησ", "απάντησ", "απαντησ"]);
-        let content_read_action = text.has_phrase(&[
-            "read",
-            "inspect",
-            "open",
-            "extract",
-            "verify",
-            "show content",
-            "what is in",
-            "what's in",
-            "look at",
-        ]) || text.has_stem(&[
-            "summar",
-            "analy",
-            "διάβασ",
-            "διαβασ",
-            "περίληψ",
-            "περιληψ",
-            "ανάλυσ",
-            "αναλυσ",
-        ]);
-        let allow_artifact_write = artifact_reference && artifact_action;
-        let allow_overwrite =
-            text.has_phrase(&["overwrite", "replace existing", "replace the existing"])
-                || (text.has_phrase(&["αντικατάστησε", "αντικαταστησε"])
-                    && text.has_stem(&["υπάρχ", "υπαρχ"]))
-                || (artifact_reference
-                    && (text.has_phrase(&["edit", "update", "replace"])
-                        || text.has_stem(&[
-                            "επεξεργ",
-                            "ενημέρωσ",
-                            "ενημερωσ",
-                            "αντικατάστ",
-                            "αντικαταστ",
-                        ])));
-        let (authorized_recipient_hashes, authorized_recipient_count) =
-            extract_recipient_hashes(raw);
-        let (authorized_attachment_hashes, authorized_attachment_count) =
-            extract_attachment_hashes(raw);
-        let authorized_location_flags = location_flags(&text);
-        let allow_system_info = text.has_phrase(&[
-            "system",
-            "cpu",
-            "processor",
-            "memory",
-            "ram",
-            "disk",
-            "storage",
-            "hardware",
-            "specs",
-            "uptime",
-            "machine",
-        ]) || text.has_stem(&[
-            "σύστημ",
-            "συστημ",
-            "μνήμ",
-            "μνημ",
-            "δίσκ",
-            "δισκ",
-            "επεξεργαστ",
-        ]);
+        let intent = ParsedIntent::parse(task);
+        let capabilities = intent.capabilities;
+        let bindings = intent.bindings;
         Self {
-            allow_mail_send: send_action
-                && (mail_object || raw.contains('@') || conversational_mail_action)
-                && !send_negated,
-            allow_trash,
-            allow_mail_attachment_save: transfer_action
-                && (attachment_reference || (mail_object && deictic_reference)),
-            allow_codex: codex_object && codex_action,
-            allow_web: (web_reference && web_action)
-                || web_download
-                || (current_information && text.has_phrase(&["search", "find", "look up"])),
-            allow_web_download: web_download,
-            allow_shell,
-            allow_file_write,
-            allow_directory_create,
-            allow_artifact_write,
-            allow_overwrite,
-            allow_file_read: filesystem_target || artifact_reference,
-            allow_file_content_read: ((filesystem_target || artifact_reference)
-                && content_read_action)
-                || allow_artifact_write,
-            allow_mail_read: (mail_object || attachment_reference)
-                && (read_action || transfer_action),
-            allow_system_info,
-            authorized_recipient_hashes,
-            authorized_recipient_count,
-            authorized_attachment_hashes,
-            authorized_attachment_count,
-            authorized_location_flags,
+            allow_mail_send: capabilities.mail_send,
+            allow_trash: capabilities.trash,
+            allow_mail_attachment_save: capabilities.mail_attachment_save,
+            allow_codex: capabilities.codex,
+            allow_web: capabilities.web,
+            allow_web_download: capabilities.web_download,
+            allow_shell: capabilities.shell,
+            allow_file_write: capabilities.file_write,
+            allow_directory_create: capabilities.directory_create,
+            allow_artifact_write: capabilities.artifact_write,
+            allow_overwrite: capabilities.overwrite,
+            allow_file_read: capabilities.file_read,
+            allow_file_content_read: capabilities.file_content_read,
+            allow_mail_read: capabilities.mail_read,
+            allow_system_info: capabilities.system_info,
+            authorized_recipient_hashes: bindings.recipient_hashes,
+            authorized_recipient_count: bindings.recipient_count,
+            authorized_attachment_hashes: bindings.attachment_hashes,
+            authorized_attachment_count: bindings.attachment_count,
+            authorized_location_flags: bindings.location_flags,
             untrusted_context: false,
         }
     }
@@ -604,6 +335,338 @@ impl TaskAuthorization {
             );
         }
         Ok(())
+    }
+}
+
+impl ParsedIntent {
+    fn parse(task: &str) -> Self {
+        let text = TaskText::new(task);
+        let raw = text.raw();
+
+        let mail_object = text
+            .has_phrase(&["email", "emails", "mail", "mails", "message", "messages"])
+            || text.has_stem(&["μήνυμ", "μηνυμ"]);
+        let send_action = text.has_phrase(&[
+            "send",
+            "forward",
+            "reply",
+            "email me",
+            "email it",
+            "email this",
+            "email that",
+            "email the",
+            "email a",
+            "mail me",
+            "mail it",
+            "mail this",
+            "mail that",
+            "mail the",
+            "mail a",
+        ]) || text.has_stem(&[
+            "στείλ",
+            "στειλ",
+            "προώθησ",
+            "προωθησ",
+            "απάντησ",
+            "απαντησ",
+            "αποστολ",
+        ]) || text.starts_with_word("email")
+            || text.starts_with_word("mail");
+        let send_negated = text.has_phrase(&[
+            "do not send",
+            "don't send",
+            "dont send",
+            "without sending",
+            "never send",
+            "do not forward",
+            "don't forward",
+            "dont forward",
+            "do not reply",
+            "don't reply",
+            "dont reply",
+        ]) || text.has_phrase(&["μη"]) && text.has_stem(&["στείλ", "στειλ"])
+            || text.has_phrase(&["χωρίς", "χωρις"]) && text.has_stem(&["αποστολ"]);
+        let transfer_action = text.has_phrase(&[
+            "save", "copy", "download", "extract", "move", "put", "store", "βάλε", "βαλε",
+        ]) || text.has_stem(&[
+            "αποθήκευσ",
+            "αποθηκευσ",
+            "αντιγρα",
+            "κατέβασ",
+            "κατεβασ",
+            "μετακίνησ",
+            "μετακινησ",
+        ]);
+        let attachment_reference = text.has_phrase(&["attachment", "attachments", "attached"])
+            || text.has_stem(&["συνημμ", "επισυναπτ"]);
+        // Deictic references ("it", "that", "this") only imply an attachment
+        // when the task also mentions mail; otherwise they collide constantly.
+        let deictic_reference = text.has_phrase(&["it", "that", "this"]);
+        let read_action = text.has_phrase(&[
+            "read", "search", "find", "check", "look", "show", "list", "inspect", "βρες",
+        ]) || text.has_stem(&[
+            "summar",
+            "analy",
+            "διάβασ",
+            "διαβασ",
+            "ψάξ",
+            "ψαξ",
+            "δείξ",
+            "δειξ",
+            "έλεγξ",
+            "ελεγξ",
+        ]);
+        let explicit_trash_action = text.has_phrase(&[
+            "move to trash",
+            "move it to trash",
+            "move that to trash",
+            "move this to trash",
+            "to trash",
+            "to the trash",
+            "trash the",
+            "trash this",
+            "trash that",
+            "into trash",
+            "into the trash",
+            "βάλε στον κάδο",
+            "βαλε στον καδο",
+            "μετακίνησε στον κάδο",
+            "μετακινησε στον καδο",
+        ]);
+        let delete_action =
+            text.has_phrase(&["delete", "remove"]) || text.has_stem(&["διαγρα", "σβήσ", "σβησ"]);
+        let delete_negated = text.has_phrase(&[
+            "do not delete",
+            "don't delete",
+            "dont delete",
+            "do not remove",
+            "don't remove",
+            "dont remove",
+            "without deleting",
+        ]) || text.has_phrase(&["μη"])
+            && text.has_stem(&["διαγρα", "σβήσ", "σβησ"]);
+        let artifact_suboperation = artifact_page_or_image_suboperation(&text);
+        let filesystem_target = text.has_phrase(&[
+            "file",
+            "files",
+            "folder",
+            "folders",
+            "directory",
+            "directories",
+            "path",
+            "desktop",
+            "documents",
+            "downloads",
+        ]) || text.has_stem(&["αρχεί", "αρχει", "φάκελ", "φακελ"])
+            || text.contains_fragment("~/")
+            || text.contains_fragment("/users/")
+            || text.has_file_extension();
+        let shell = text.has_phrase(&["shell", "terminal", "command", "script", "bash", "zsh"])
+            || text.has_phrase(&["γραμμή εντολών", "γραμμη εντολων"])
+            || text.has_stem(&["τερματικ"]);
+        let codex_object = text.has_phrase(&["codex", "codex cli", "code cli"]);
+        let codex_action = text.has_phrase(&[
+            "use codex",
+            "run codex",
+            "start codex",
+            "ask codex",
+            "resume codex",
+            "continue codex",
+            "supervise codex",
+            "control codex",
+            "delegate to codex",
+            "with codex",
+            "use code cli",
+            "run code cli",
+        ]);
+        let web_reference = text
+            .has_phrase(&["web", "website", "webpage", "internet", "online", "url"])
+            || text.contains_fragment("http://")
+            || text.contains_fragment("https://");
+        let web_action = text.has_phrase(&[
+            "search",
+            "browse",
+            "look up",
+            "research",
+            "find online",
+            "search online",
+            "search the web",
+            "fetch",
+            "visit",
+            "open the url",
+            "read the url",
+            "read the website",
+        ]);
+        let current_information = text.has_phrase(&[
+            "latest",
+            "current news",
+            "recent news",
+            "today's news",
+            "todays news",
+        ]);
+        let write_verb = text.has_phrase(&["write", "create", "save", "make"])
+            || text.has_stem(&["γραψ", "δημιουργησ", "φτιαξ", "βαλ"]);
+        let file_noun = text.has_phrase(&[
+            "file",
+            "files",
+            "report",
+            "reports",
+            "summary",
+            "summaries",
+            "note",
+            "notes",
+            "script",
+            "scripts",
+            "txt",
+        ]) || text.has_stem(&["αρχε"])
+            || text.has_file_extension();
+        let file_write = write_verb && file_noun;
+        let directory_create = ((text.has_phrase(&["create", "make"]))
+            && text.has_phrase(&["folder", "directory"]))
+            || (text.has_stem(&["δημιούργησ", "δημιουργησ", "φτιάξ", "φτιαξ"])
+                && text.has_stem(&["φάκελ", "φακελ"]));
+        let artifact_reference =
+            text.has_phrase(&[
+                "docx",
+                "document",
+                "documents",
+                "pdf",
+                "xlsx",
+                "spreadsheet",
+                "workbook",
+                "image",
+                "images",
+                "phot",
+                "photo",
+                "photos",
+                "png",
+                "jpg",
+                "jpeg",
+                "gif",
+                "webp",
+                "tiff",
+            ]) || text.has_stem(&["έγγρα", "εγγρα", "εικόν", "εικον", "φωτογραφ"]);
+        let web_download = transfer_action
+            && (artifact_reference
+                || file_noun
+                || text.has_phrase(&["from the web", "from the internet", "online"]));
+        let artifact_action = text.has_phrase(&[
+            "create",
+            "edit",
+            "update",
+            "replace",
+            "resize",
+            "crop",
+            "rotate",
+            "convert",
+            "grayscale",
+        ]) || text.has_phrase(&["remove page", "remove pages"])
+            || text.has_stem(&[
+                "δημιούργησ",
+                "δημιουργησ",
+                "επεξεργ",
+                "ενημέρωσ",
+                "ενημερωσ",
+                "αντικατάστ",
+                "αντικαταστ",
+                "περιστρ",
+                "μετατροπ",
+            ]);
+        let conversational_mail_action = text.has_phrase(&["forward", "reply"])
+            || text.has_stem(&["προώθησ", "προωθησ", "απάντησ", "απαντησ"]);
+        let content_read_action = text.has_phrase(&[
+            "read",
+            "inspect",
+            "open",
+            "extract",
+            "verify",
+            "show content",
+            "what is in",
+            "what's in",
+            "look at",
+        ]) || text.has_stem(&[
+            "summar",
+            "analy",
+            "διάβασ",
+            "διαβασ",
+            "περίληψ",
+            "περιληψ",
+            "ανάλυσ",
+            "αναλυσ",
+        ]);
+        let artifact_write = artifact_reference && artifact_action;
+        let overwrite = text.has_phrase(&["overwrite", "replace existing", "replace the existing"])
+            || (text.has_phrase(&["αντικατάστησε", "αντικαταστησε"])
+                && text.has_stem(&["υπάρχ", "υπαρχ"]))
+            || (artifact_reference
+                && (text.has_phrase(&["edit", "update", "replace"])
+                    || text.has_stem(&[
+                        "επεξεργ",
+                        "ενημέρωσ",
+                        "ενημερωσ",
+                        "αντικατάστ",
+                        "αντικαταστ",
+                    ])));
+        let system_info = text.has_phrase(&[
+            "system",
+            "cpu",
+            "processor",
+            "memory",
+            "ram",
+            "disk",
+            "storage",
+            "hardware",
+            "specs",
+            "uptime",
+            "machine",
+        ]) || text.has_stem(&[
+            "σύστημ",
+            "συστημ",
+            "μνήμ",
+            "μνημ",
+            "δίσκ",
+            "δισκ",
+            "επεξεργαστ",
+        ]);
+
+        let (recipient_hashes, recipient_count) = extract_recipient_hashes(raw);
+        let (attachment_hashes, attachment_count) = extract_attachment_hashes(raw);
+        Self {
+            capabilities: CapabilitySet {
+                mail_send: send_action
+                    && (mail_object || raw.contains('@') || conversational_mail_action)
+                    && !send_negated,
+                trash: (explicit_trash_action
+                    || (delete_action && !artifact_suboperation && filesystem_target))
+                    && !delete_negated,
+                mail_attachment_save: transfer_action
+                    && (attachment_reference || (mail_object && deictic_reference)),
+                codex: codex_object && codex_action,
+                web: (web_reference && web_action)
+                    || web_download
+                    || (current_information && text.has_phrase(&["search", "find", "look up"])),
+                web_download,
+                shell,
+                file_write,
+                directory_create,
+                artifact_write,
+                overwrite,
+                file_read: filesystem_target || artifact_reference,
+                file_content_read: ((filesystem_target || artifact_reference)
+                    && content_read_action)
+                    || artifact_write,
+                mail_read: (mail_object || attachment_reference)
+                    && (read_action || transfer_action),
+                system_info,
+            },
+            bindings: AuthorizationBindings {
+                recipient_hashes,
+                recipient_count,
+                attachment_hashes,
+                attachment_count,
+                location_flags: location_flags(&text),
+            },
+        }
     }
 }
 
@@ -2241,6 +2304,23 @@ mod tests {
         assert!(exposed.iter().any(|tool| tool == "write_file"));
         assert!(exposed.iter().any(|tool| tool == "openrouter:web_search"));
         assert!(!exposed.iter().any(|tool| tool == "mail_send"));
+    }
+
+    #[test]
+    fn parsed_intent_separates_capabilities_from_bindings() {
+        let intent = ParsedIntent::parse(
+            "Email report.pdf to safe@example.com and save the attachment in Documents",
+        );
+        assert!(intent.capabilities.mail_send);
+        assert!(intent.capabilities.mail_attachment_save);
+        assert!(intent.capabilities.mail_read);
+        assert!(!intent.capabilities.trash);
+        assert_eq!(intent.bindings.recipient_count, 1);
+        assert_eq!(intent.bindings.attachment_count, 1);
+        assert_eq!(
+            location_flag_names(intent.bindings.location_flags),
+            vec!["Documents"]
+        );
     }
 
     #[test]
