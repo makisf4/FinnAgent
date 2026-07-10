@@ -18,7 +18,6 @@ pub struct TaskAuthorization {
     allow_codex: bool,
     allow_web: bool,
     allow_web_download: bool,
-    allow_shell: bool,
     allow_file_write: bool,
     allow_directory_create: bool,
     allow_artifact_write: bool,
@@ -45,7 +44,6 @@ struct CapabilitySet {
     codex: bool,
     web: bool,
     web_download: bool,
-    shell: bool,
     file_write: bool,
     directory_create: bool,
     artifact_write: bool,
@@ -85,7 +83,6 @@ impl TaskAuthorization {
             allow_codex: capabilities.codex,
             allow_web: capabilities.web,
             allow_web_download: capabilities.web_download,
-            allow_shell: capabilities.shell,
             allow_file_write: capabilities.file_write,
             allow_directory_create: capabilities.directory_create,
             allow_artifact_write: capabilities.artifact_write,
@@ -138,7 +135,6 @@ impl TaskAuthorization {
                 "codex": self.allow_codex,
                 "web": self.allow_web,
                 "web_download": self.allow_web_download,
-                "shell": self.allow_shell,
                 "file_write": self.allow_file_write,
                 "directory_create": self.allow_directory_create,
                 "artifact_write": self.allow_artifact_write,
@@ -668,7 +664,6 @@ impl ParsedIntent {
                     || web_download
                     || (current_information && text.has_phrase(&["search", "find", "look up"])),
                 web_download,
-                shell: false,
                 file_write,
                 directory_create,
                 artifact_write,
@@ -990,7 +985,6 @@ mod tests {
         MailSend,
         Trash,
         AttachmentSave,
-        Shell,
         FileWrite,
         DirCreate,
         ArtifactWrite,
@@ -1008,7 +1002,6 @@ mod tests {
                 Cap::MailSend => auth.allow_mail_send,
                 Cap::Trash => auth.allow_trash,
                 Cap::AttachmentSave => auth.allow_mail_attachment_save,
-                Cap::Shell => auth.allow_shell,
                 Cap::FileWrite => auth.allow_file_write,
                 Cap::DirCreate => auth.allow_directory_create,
                 Cap::ArtifactWrite => auth.allow_artifact_write,
@@ -1036,7 +1029,6 @@ mod tests {
                 &[
                     MailSend,
                     Trash,
-                    Shell,
                     FileWrite,
                     DirCreate,
                     ArtifactWrite,
@@ -1046,20 +1038,13 @@ mod tests {
             (
                 "Does the folder named Makis exist on my Desktop?",
                 &[FileRead],
-                &[
-                    MailSend,
-                    Trash,
-                    Shell,
-                    FileWrite,
-                    DirCreate,
-                    FileContentRead,
-                ],
+                &[MailSend, Trash, FileWrite, DirCreate, FileContentRead],
             ),
             // Directory + file creation.
             (
                 "Create a folder named Makis on my Desktop",
                 &[DirCreate, FileRead],
-                &[MailSend, Trash, Shell, FileWrite, ArtifactWrite],
+                &[MailSend, Trash, FileWrite, ArtifactWrite],
             ),
             (
                 "Write a zsh script on my Desktop that reports the ten largest files",
@@ -1069,82 +1054,74 @@ mod tests {
             (
                 "download o phot of larry bird on the Desktop",
                 &[FileRead, WebDownload],
-                &[MailSend, Trash, Shell],
+                &[MailSend, Trash],
             ),
             (
                 "Create 12 folders on my Desktop named January through December. Inside each folder, create 7 empty TXT files named Monday.txt through Sunday.txt.",
                 &[DirCreate, FileWrite, FileRead],
-                &[MailSend, Trash, Shell],
+                &[MailSend, Trash],
             ),
             (
                 "φτιάξε μου 12 φακέλους με τα ονόματα των μηνών στο Desktop και μέσα βάλε 7 txt με τα ονόματα των ημερών",
                 &[DirCreate, FileWrite, FileRead],
-                &[MailSend, Trash, Shell],
+                &[MailSend, Trash],
             ),
             (
                 "χρησιμοποίησε bash και φτιάξε μου 12 φακέλους με τα ονόματα των μηνών στο Desktop και μέσα βάλε 7 txt με τα ονόματα των ημερών",
                 &[DirCreate, FileWrite, FileRead],
-                &[Shell, MailSend, Trash],
+                &[MailSend, Trash],
             ),
             // Deletion routes to Trash only for filesystem targets.
-            ("Delete note.txt", &[Trash], &[MailSend, Shell]),
-            ("Move that folder to Trash", &[Trash], &[MailSend, Shell]),
+            ("Delete note.txt", &[Trash], &[MailSend]),
+            ("Move that folder to Trash", &[Trash], &[MailSend]),
             (
                 "Remove page 2 from report.pdf",
                 &[ArtifactWrite],
-                &[Trash, MailSend, Shell],
+                &[Trash, MailSend],
             ),
             ("Remove the attachment from the email", &[], &[Trash]),
             (
                 "Read it but do not delete anything",
                 &[],
-                &[Trash, MailSend, Shell],
+                &[Trash, MailSend],
             ),
             (
                 "Read the note but do not send email, delete files, or overwrite anything",
                 &[FileRead],
-                &[Trash, MailSend, Shell, Overwrite],
+                &[Trash, MailSend, Overwrite],
             ),
             // Mail reading vs sending.
             (
                 "Find emails from example.com in my inbox",
                 &[MailRead],
-                &[MailSend, Trash, Shell, FileWrite],
+                &[MailSend, Trash, FileWrite],
             ),
-            ("Read my email from Alex", &[MailRead], &[MailSend, Shell]),
-            (
-                "Please email the report to Alex",
-                &[],
-                &[MailSend, Trash, Shell],
-            ),
-            (
-                "Send \"hello\" to alex@example.com",
-                &[MailSend],
-                &[Trash, Shell],
-            ),
+            ("Read my email from Alex", &[MailRead], &[MailSend]),
+            ("Please email the report to Alex", &[], &[MailSend, Trash]),
+            ("Send \"hello\" to alex@example.com", &[MailSend], &[Trash]),
             ("Read it but do not send any email", &[], &[MailSend]),
             ("Forward it to Alex", &[], &[MailSend, Trash]),
             // Attachment save requires an attachment reference or mail deixis.
             (
                 "Save the invoice attached to Alex's email in ~/Documents/Invoices",
                 &[AttachmentSave],
-                &[MailSend, Shell],
+                &[MailSend],
             ),
             // Artifact writes and overwrites.
             (
                 "Read report.docx and create summary.docx in Documents",
                 &[ArtifactWrite, FileRead, FileContentRead],
-                &[MailSend, Shell, Trash],
+                &[MailSend, Trash],
             ),
             (
                 "Create a DOCX report",
                 &[ArtifactWrite],
-                &[Overwrite, MailSend, Shell],
+                &[Overwrite, MailSend],
             ),
             (
                 "Replace Revenue with Profit in report.docx",
                 &[ArtifactWrite, Overwrite],
-                &[MailSend, Shell],
+                &[MailSend],
             ),
             (
                 "Create a DOCX report and overwrite the existing file",
@@ -1155,19 +1132,19 @@ mod tests {
             (
                 "Run a bash command to list processes",
                 &[],
-                &[Shell, MailSend, Trash],
+                &[MailSend, Trash],
             ),
             (
                 "Summarize my Documents folder",
                 &[FileRead],
-                &[Shell, MailSend, Trash, FileWrite],
+                &[MailSend, Trash, FileWrite],
             ),
             // False-positive guards from the tokenized rewrite.
-            // "commander" must not trip the shell "command" keyword.
+            // "commander" must not trip word-boundary keyword matching.
             (
                 "Find files about the commander in Downloads",
                 &[FileRead],
-                &[Shell, MailSend, Trash],
+                &[MailSend, Trash],
             ),
             // A bare deictic without mail context must not imply attachment save.
             ("Copy that to Documents", &[], &[AttachmentSave, MailSend]),
@@ -1175,7 +1152,7 @@ mod tests {
             (
                 "What's in report.pdf?",
                 &[FileRead, FileContentRead],
-                &[MailSend, Shell, Trash],
+                &[MailSend, Trash],
             ),
             // Apostrophe negation still blocks sending.
             (
@@ -1187,12 +1164,12 @@ mod tests {
             (
                 "write a system report about my cpu, memory and disk space",
                 &[SystemInfo],
-                &[Shell, MailSend, Trash],
+                &[MailSend, Trash],
             ),
             (
                 "how much memory and disk space do I have?",
                 &[SystemInfo],
-                &[Shell, MailSend, FileWrite],
+                &[MailSend, FileWrite],
             ),
         ];
 

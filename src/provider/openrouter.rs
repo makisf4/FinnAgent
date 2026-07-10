@@ -240,7 +240,6 @@ fn parse_dsml_tool_calls(content: &str) -> Result<Option<Vec<ToolCall>>> {
             arguments.insert(param_name, Value::String(value));
             body_remaining = &body_remaining[value_end + param_close.len()..];
         }
-        normalize_dsml_arguments(&name, &mut arguments);
         calls.push(ToolCall {
             id: format!("dsml_call_{}", calls.len() + 1),
             name,
@@ -253,19 +252,6 @@ fn parse_dsml_tool_calls(content: &str) -> Result<Option<Vec<ToolCall>>> {
         bail!("OpenRouter DSML tool-call format mismatch: no invoke blocks found");
     }
     Ok(Some(calls))
-}
-
-fn normalize_dsml_arguments(name: &str, arguments: &mut Map<String, Value>) {
-    if name == "run_shell" {
-        if !arguments.contains_key("command")
-            && let Some(command) = arguments.remove("cmd")
-        {
-            arguments.insert("command".to_owned(), command);
-        }
-        arguments
-            .entry("timeout_seconds".to_owned())
-            .or_insert(Value::Number(120_u64.into()));
-    }
 }
 
 fn attribute_value(tag: &str, name: &str) -> Option<String> {
@@ -333,8 +319,8 @@ mod tests {
         assert_eq!(turn.tool_calls[0].id, "dsml_call_1");
         assert_eq!(turn.tool_calls[0].name, "run_shell");
         let args: Value = serde_json::from_str(&turn.tool_calls[0].arguments).unwrap();
-        assert_eq!(args["command"], "find ~ -type f -size +300M 2>/dev/null");
-        assert_eq!(args["timeout_seconds"], 120);
+        assert_eq!(args["cmd"], "find ~ -type f -size +300M 2>/dev/null");
+        assert_eq!(args["description"], "Find files larger than 300MB");
     }
 
     #[test]
