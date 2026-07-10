@@ -22,19 +22,20 @@ pub fn render(input: &str, color: bool) -> String {
 
     for line in input.lines() {
         let trimmed = line.trim_start();
-        // Fenced code blocks: ``` or ~~~
-        if let Some(rest) = fence_marker(trimmed) {
-            if in_code_block {
-                if trimmed.starts_with(fence) {
-                    in_code_block = false;
-                    fence = "";
-                    continue;
-                }
-            } else {
+        // Fenced code blocks: ``` or ~~~. Per CommonMark, a block closes only
+        // on the token that opened it; the other token is ordinary content.
+        match fence_marker(trimmed) {
+            Some(marker) if !in_code_block => {
                 in_code_block = true;
-                fence = rest;
+                fence = marker;
                 continue;
             }
+            Some(marker) if marker == fence => {
+                in_code_block = false;
+                fence = "";
+                continue;
+            }
+            _ => {}
         }
         if in_code_block {
             if color {
@@ -222,6 +223,16 @@ mod tests {
         assert!(!plain.contains("```"));
         assert!(plain.contains("before"));
         assert!(plain.contains("after"));
+    }
+
+    #[test]
+    fn code_blocks_close_only_on_their_own_fence_token() {
+        let input = "```\n~~~ inside\n```\n**after**";
+        let plain = render(input, false);
+        assert!(plain.contains("~~~ inside"));
+        // The block closed on ```, so Markdown after it renders normally.
+        assert!(plain.contains("after"));
+        assert!(!plain.contains("**after**"));
     }
 
     #[test]
