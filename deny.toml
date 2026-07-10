@@ -7,6 +7,13 @@ yanked = "deny"
 # Transitive unmaintained crates are reported by cargo-audit. Fail this gate
 # only when Finn directly depends on an unmaintained crate.
 unmaintained = "workspace"
+ignore = [
+    # docx-rs 0.4.20 is writer-only in Finn; no untrusted XML reaches its reader.
+    # umya-spreadsheet 3.0.0 has no fixed release yet. Finn scans every OOXML
+    # entry before parsing and rejects tags with excessive size or attributes.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+]
 
 [licenses]
 version = 2

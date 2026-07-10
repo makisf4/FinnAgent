@@ -4,7 +4,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use docx_rs::{Docx, Paragraph, Run};
-use quick_xml::events::{BytesText, Event};
+use quick_xml::events::{BytesRef, BytesText, Event};
 use quick_xml::{Reader, Writer};
 use zip::ZipWriter;
 use zip::read::ZipArchive;
@@ -127,16 +127,20 @@ fn extract_docx_text(path: &Path) -> Result<String> {
     loop {
         match reader.read_event()? {
             Event::Start(event) => {
-                in_text = event.name().as_ref().ends_with(b":t");
+                in_text = event.local_name().as_ref() == b"t";
             }
-            Event::Text(event) if in_text => output.push_str(&event.unescape()?),
+            Event::Text(event) if in_text => {
+                let decoded = event.decode()?;
+                output.push_str(&decoded);
+            }
+            Event::GeneralRef(event) if in_text => output.push_str(&reference_text(&event)?),
             Event::End(event) => {
-                let name = event.name();
-                if name.as_ref().ends_with(b":t") {
+                let name = event.local_name();
+                if name.as_ref() == b"t" {
                     in_text = false;
-                } else if name.as_ref().ends_with(b":tc") {
+                } else if name.as_ref() == b"tc" {
                     output.push('\t');
-                } else if name.as_ref().ends_with(b":p") || name.as_ref().ends_with(b":tr") {
+                } else if name.as_ref() == b"p" || name.as_ref() == b"tr" {
                     output.push('\n');
                 }
             }
@@ -188,22 +192,29 @@ fn replace_xml_text_nodes(xml: &str, find: &str, replacement: &str) -> Result<(V
     reader.config_mut().trim_text(false);
     let mut writer = Writer::new(Vec::with_capacity(xml.len()));
     let mut in_text = false;
+    let mut text_content = String::new();
     let mut count = 0_usize;
     loop {
         match reader.read_event()? {
             Event::Start(event) => {
-                in_text = event.name().as_ref().ends_with(b":t");
+                in_text = event.local_name().as_ref() == b"t";
+                if in_text {
+                    text_content.clear();
+                }
                 writer.write_event(Event::Start(event.into_owned()))?;
             }
             Event::Text(event) if in_text => {
-                let decoded = event.unescape()?.into_owned();
-                count += decoded.matches(find).count();
-                writer.write_event(Event::Text(BytesText::new(
-                    &decoded.replace(find, replacement),
-                )))?;
+                text_content.push_str(&event.decode()?);
+            }
+            Event::GeneralRef(event) if in_text => {
+                text_content.push_str(&reference_text(&event)?);
             }
             Event::End(event) => {
-                if event.name().as_ref().ends_with(b":t") {
+                if event.local_name().as_ref() == b"t" {
+                    count += text_content.matches(find).count();
+                    writer.write_event(Event::Text(BytesText::new(
+                        &text_content.replace(find, replacement),
+                    )))?;
                     in_text = false;
                 }
                 writer.write_event(Event::End(event.into_owned()))?;
@@ -213,6 +224,21 @@ fn replace_xml_text_nodes(xml: &str, find: &str, replacement: &str) -> Result<(V
         }
     }
     Ok((writer.into_inner(), count))
+}
+
+fn reference_text(reference: &BytesRef<'_>) -> Result<String> {
+    if let Some(character) = reference.resolve_char_ref()? {
+        return Ok(character.to_string());
+    }
+    let name = reference.decode()?;
+    match name.as_ref() {
+        "amp" => Ok("&".to_owned()),
+        "lt" => Ok("<".to_owned()),
+        "gt" => Ok(">".to_owned()),
+        "quot" => Ok("\"".to_owned()),
+        "apos" => Ok("'".to_owned()),
+        _ => bail!("unsupported XML entity reference: &{name};"),
+    }
 }
 
 #[cfg(test)]
@@ -251,7 +277,7 @@ mod tests {
 
     #[test]
     fn xml_replacement_escapes_inserted_text() {
-        let xml = r#"<w:p><w:r><w:t>A &amp; B</w:t></w:r></w:p>"#;
+        let xml = r#"<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:r><w:t>A &amp; B</w:t></w:r></w:p>"#;
         let (updated, count) = replace_xml_text_nodes(xml, "A & B", "C < D").unwrap();
         let updated = String::from_utf8(updated).unwrap();
         assert_eq!(count, 1);

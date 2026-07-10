@@ -248,7 +248,7 @@ async fn eval_deepseek_dsml_pseudo_call_is_not_final_answer() {
                 outcome.answer,
                 "Shell was unavailable, so I did not run it."
             );
-            assert!(outcome.requests[1].contains("run_shell is disabled by default"));
+            assert!(outcome.requests[1].contains("run_shell is unavailable"));
             assert!(!outcome.answer.contains("DSML"));
         },
     }
@@ -279,9 +279,9 @@ async fn eval_negated_high_impact_actions_are_not_exposed() {
 }
 
 #[tokio::test]
-async fn eval_shell_request_is_authorized_but_disabled_by_default() {
+async fn eval_shell_request_fails_closed() {
     Scenario {
-        name: "shell disabled by default",
+        name: "shell unavailable",
         task: "run a shell command to print ok",
         responses: vec![
             (
@@ -305,7 +305,7 @@ async fn eval_shell_request_is_authorized_but_disabled_by_default() {
             assert_eq!(outcome.tool_calls, 1);
             assert_eq!(outcome.answer, "Shell was not enabled.");
             assert!(!outcome.requests[0].contains(r#""name":"run_shell""#));
-            assert!(outcome.requests[1].contains("run_shell is disabled by default"));
+            assert!(outcome.requests[1].contains("run_shell is unavailable"));
         },
     }
     .run()

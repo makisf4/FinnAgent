@@ -1,0 +1,8 @@
+[advisories]
+ignore = [
+    # Latest docx-rs and umya-spreadsheet releases still depend on affected
+    # quick-xml versions. Finn uses docx-rs only for output and preflights every
+    # untrusted OOXML entry before umya-spreadsheet parses it.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+]

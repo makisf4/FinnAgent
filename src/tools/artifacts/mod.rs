@@ -4,6 +4,7 @@ mod pdf;
 mod spreadsheet;
 
 use std::fs::File;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -19,6 +20,8 @@ const MAX_ARTIFACT_BYTES: u64 = 100 * 1024 * 1024;
 const MAX_ARCHIVE_ENTRIES: usize = 10_000;
 const MAX_ARCHIVE_ENTRY_BYTES: u64 = 100 * 1024 * 1024;
 const MAX_ARCHIVE_EXPANDED_BYTES: u64 = 250 * 1024 * 1024;
+const MAX_XML_TAG_BYTES: usize = 64 * 1024;
+const MAX_XML_ATTRIBUTES: usize = 256;
 
 fn ensure_input_file(path: &Path) -> Result<()> {
     let metadata = std::fs::metadata(path)
@@ -57,7 +60,7 @@ fn ensure_safe_archive(path: &Path) -> Result<()> {
     }
     let mut expanded = 0_u64;
     for index in 0..archive.len() {
-        let entry = archive.by_index(index)?;
+        let mut entry = archive.by_index(index)?;
         if entry.size() > MAX_ARCHIVE_ENTRY_BYTES {
             bail!(
                 "artifact archive entry is too large ({} bytes): {}",
@@ -74,6 +77,71 @@ fn ensure_safe_archive(path: &Path) -> Result<()> {
                 MAX_ARCHIVE_EXPANDED_BYTES / (1024 * 1024)
             );
         }
+        let name = entry.name().to_ascii_lowercase();
+        if name.ends_with(".xml") || name.ends_with(".rels") {
+            scan_xml_structure(&mut entry, &name)?;
+        }
+    }
+    Ok(())
+}
+
+/// Rejects XML constructs that can trigger pathological behavior in parser
+/// versions still used by the latest docx-rs and umya-spreadsheet releases.
+/// This scan is linear and runs before either dependency sees untrusted OOXML.
+fn scan_xml_structure(reader: &mut impl Read, name: &str) -> Result<()> {
+    let mut buffer = [0_u8; 8192];
+    let mut in_tag = false;
+    let mut quote = None;
+    let mut tag_bytes = 0_usize;
+    let mut attributes = 0_usize;
+
+    loop {
+        let count = reader
+            .read(&mut buffer)
+            .with_context(|| format!("cannot inspect XML archive entry {name}"))?;
+        if count == 0 {
+            break;
+        }
+        for &byte in &buffer[..count] {
+            if !in_tag {
+                if byte == b'<' {
+                    in_tag = true;
+                    quote = None;
+                    tag_bytes = 1;
+                    attributes = 0;
+                }
+                continue;
+            }
+
+            tag_bytes += 1;
+            if tag_bytes > MAX_XML_TAG_BYTES {
+                bail!(
+                    "XML archive entry {name} contains a tag larger than {MAX_XML_TAG_BYTES} bytes"
+                );
+            }
+            if let Some(delimiter) = quote {
+                if byte == delimiter {
+                    quote = None;
+                }
+                continue;
+            }
+            match byte {
+                b'\'' | b'"' => quote = Some(byte),
+                b'=' => {
+                    attributes += 1;
+                    if attributes > MAX_XML_ATTRIBUTES {
+                        bail!(
+                            "XML archive entry {name} contains more than {MAX_XML_ATTRIBUTES} attributes in one tag"
+                        );
+                    }
+                }
+                b'>' => in_tag = false,
+                _ => {}
+            }
+        }
+    }
+    if in_tag {
+        bail!("XML archive entry {name} ends inside an unterminated tag");
     }
     Ok(())
 }
@@ -133,4 +201,54 @@ fn clipped(mut value: String, max_chars: usize) -> String {
     value = value.chars().take(max_chars).collect();
     value.push_str("\n[truncated]");
     value
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs::File;
+    use std::io::Cursor;
+    use std::io::Write;
+
+    use zip::ZipWriter;
+    use zip::write::SimpleFileOptions;
+
+    use super::*;
+
+    #[test]
+    fn rejects_xml_tags_with_excessive_attributes() {
+        let attributes = (0..=MAX_XML_ATTRIBUTES)
+            .map(|index| format!(" a{index}=\"x\""))
+            .collect::<String>();
+        let xml = format!("<root{attributes}/>");
+        let error = scan_xml_structure(&mut Cursor::new(xml), "word/document.xml")
+            .expect_err("attribute limit must be enforced");
+        assert!(error.to_string().contains("more than 256 attributes"));
+    }
+
+    #[test]
+    fn accepts_normal_xml_and_quoted_delimiters() {
+        let xml = br#"<root value="a > b = c"><child id='1'>ok</child></root>"#;
+        scan_xml_structure(&mut Cursor::new(xml), "word/document.xml").unwrap();
+    }
+
+    #[test]
+    fn archive_preflight_rejects_hostile_ooxml_before_parsing() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("hostile.xlsx");
+        let file = File::create(&path).unwrap();
+        let mut archive = ZipWriter::new(file);
+        archive
+            .start_file("xl/workbook.xml", SimpleFileOptions::default())
+            .unwrap();
+        let attributes = (0..=MAX_XML_ATTRIBUTES)
+            .map(|index| format!(" a{index}=\"x\""))
+            .collect::<String>();
+        archive
+            .write_all(format!("<workbook{attributes}/>").as_bytes())
+            .unwrap();
+        archive.finish().unwrap();
+
+        let error = ensure_safe_archive(&path).expect_err("hostile OOXML must be rejected");
+        assert!(error.to_string().contains("more than 256 attributes"));
+    }
 }

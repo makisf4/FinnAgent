@@ -8,7 +8,6 @@ mod markdown;
 mod orchestrator;
 mod prompt;
 mod provider;
-mod safety;
 mod tools;
 mod ui;
 
@@ -49,14 +48,7 @@ async fn run() -> Result<()> {
         println!("model: {model}");
         println!("reasoning: {reasoning}");
         println!("tools: {}", tools::definitions().len());
-        println!(
-            "shell: {}",
-            if tools::shell_enabled() {
-                "enabled"
-            } else {
-                "disabled"
-            }
-        );
+        println!("shell: unavailable (use dedicated tools or Codex delegation)");
         println!("web: available on explicit requests");
         println!("{key_name}: {key_status}");
         return Ok(());

@@ -3,7 +3,6 @@ mod codex;
 mod confirm;
 mod filesystem;
 mod mail;
-mod shell;
 mod sysinfo;
 mod web;
 
@@ -37,6 +36,8 @@ pub struct TaskAuthorization {
     authorized_recipient_count: u8,
     authorized_attachment_hashes: [u64; 8],
     authorized_attachment_count: u8,
+    authorized_target_hashes: [u64; 16],
+    authorized_target_count: u8,
     authorized_location_flags: u8,
     untrusted_context: bool,
 }
@@ -66,6 +67,8 @@ struct AuthorizationBindings {
     recipient_count: u8,
     attachment_hashes: [u64; 8],
     attachment_count: u8,
+    target_hashes: [u64; 16],
+    target_count: u8,
     location_flags: u8,
 }
 
@@ -100,6 +103,8 @@ impl TaskAuthorization {
             authorized_recipient_count: bindings.recipient_count,
             authorized_attachment_hashes: bindings.attachment_hashes,
             authorized_attachment_count: bindings.attachment_count,
+            authorized_target_hashes: bindings.target_hashes,
+            authorized_target_count: bindings.target_count,
             authorized_location_flags: bindings.location_flags,
             untrusted_context: false,
         }
@@ -151,6 +156,7 @@ impl TaskAuthorization {
             "bindings": {
                 "recipients": self.authorized_recipient_count,
                 "attachments": self.authorized_attachment_count,
+                "targets": self.authorized_target_count,
                 "locations": location_flag_names(self.authorized_location_flags),
             },
             "exposed_tools": exposed_tools,
@@ -179,12 +185,9 @@ impl TaskAuthorization {
             {
                 Ok(())
             }
-            "run_shell" if self.untrusted_context => {
-                bail!(
-                    "run_shell denied: untrusted external data is present in this conversation; start a new Finn session for an explicit shell task"
-                )
-            }
-            "run_shell" if self.allow_shell => Ok(()),
+            "run_shell" => bail!(
+                "run_shell is unavailable; use Finn's dedicated tools or explicitly request Codex delegation"
+            ),
             "system_info" if self.allow_system_info => Ok(()),
             "download_url" if self.allow_web_download => Ok(()),
             "write_file" if self.allow_file_write => Ok(()),
@@ -200,9 +203,6 @@ impl TaskAuthorization {
                 Ok(())
             }
             "mail_save_attachment" => Ok(()),
-            "run_shell" => bail!(
-                "run_shell denied: the user's current task did not explicitly request shell, terminal, command, or script execution"
-            ),
             _ if self.untrusted_context => bail!(
                 "{name} denied: untrusted external data is active and the user's current task did not explicitly authorize this capability"
             ),
@@ -222,9 +222,6 @@ impl TaskAuthorization {
     }
 
     fn require_mail_recipient(self, recipient: &str) -> Result<()> {
-        if !self.untrusted_context {
-            return Ok(());
-        }
         let hash = stable_text_hash(&recipient.trim().to_ascii_lowercase());
         if self.authorized_recipient_hashes[..self.authorized_recipient_count as usize]
             .contains(&hash)
@@ -232,13 +229,13 @@ impl TaskAuthorization {
             Ok(())
         } else {
             bail!(
-                "mail_send denied: after reading untrusted mail, the recipient must be an explicit email address in the user's current task"
+                "mail_send denied: the recipient must be an explicit email address in the user's current task"
             )
         }
     }
 
     fn require_outbound_attachments(self, attachments: &[PathBuf]) -> Result<()> {
-        if !self.untrusted_context || attachments.is_empty() {
+        if attachments.is_empty() {
             return Ok(());
         }
         let authorized =
@@ -249,11 +246,25 @@ impl TaskAuthorization {
             };
             if !authorized.contains(&stable_text_hash(&name.to_ascii_lowercase())) {
                 bail!(
-                    "mail_send attachment denied: after reading untrusted mail, every attachment file name must be explicit in the user's current task"
+                    "mail_send attachment denied: every attachment file name must be explicit in the user's current task"
                 );
             }
         }
         Ok(())
+    }
+
+    fn require_trash_path(self, path: &Path) -> Result<()> {
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            bail!("move_to_trash denied: target path has no valid file name");
+        };
+        let hash = stable_text_hash(&name.to_ascii_lowercase());
+        if self.authorized_target_hashes[..self.authorized_target_count as usize].contains(&hash) {
+            Ok(())
+        } else {
+            bail!(
+                "move_to_trash denied: the target filename or path must be explicit in the user's current task"
+            )
+        }
     }
 
     fn require_read_path(self, path: &Path, home: &Path, content: bool) -> Result<()> {
@@ -463,9 +474,6 @@ impl ParsedIntent {
             || text.contains_fragment("~/")
             || text.contains_fragment("/users/")
             || text.has_file_extension();
-        let shell = text.has_phrase(&["shell", "terminal", "command", "script", "bash", "zsh"])
-            || text.has_phrase(&["γραμμή εντολών", "γραμμη εντολων"])
-            || text.has_stem(&["τερματικ"]);
         let codex_object = text.has_phrase(&["codex", "codex cli", "code cli"]);
         let codex_action = text.has_phrase(&[
             "use codex",
@@ -643,11 +651,13 @@ impl ParsedIntent {
 
         let (recipient_hashes, recipient_count) = extract_recipient_hashes(raw);
         let (attachment_hashes, attachment_count) = extract_attachment_hashes(raw);
+        let (target_hashes, target_count) = extract_target_hashes(raw);
         Self {
             capabilities: CapabilitySet {
                 mail_send: send_action
                     && (mail_object || raw.contains('@') || conversational_mail_action)
-                    && !send_negated,
+                    && !send_negated
+                    && recipient_count > 0,
                 trash: (explicit_trash_action
                     || (delete_action && !artifact_suboperation && filesystem_target))
                     && !delete_negated,
@@ -658,7 +668,7 @@ impl ParsedIntent {
                     || web_download
                     || (current_information && text.has_phrase(&["search", "find", "look up"])),
                 web_download,
-                shell,
+                shell: false,
                 file_write,
                 directory_create,
                 artifact_write,
@@ -676,6 +686,8 @@ impl ParsedIntent {
                 recipient_count,
                 attachment_hashes,
                 attachment_count,
+                target_hashes,
+                target_count,
                 location_flags: location_flags(&text),
             },
         }
@@ -688,10 +700,6 @@ pub struct ToolContext {
     data_dir: PathBuf,
     confirmer: Confirmer,
     codex_sessions: codex::SessionStore,
-}
-
-pub fn shell_enabled() -> bool {
-    shell::enabled()
 }
 
 /// Returns only capabilities authorized by the current user request.
@@ -1017,25 +1025,13 @@ impl ToolContext {
                 authorization.require_trash()?;
                 let path = self.path_arg(&args)?;
                 filesystem::ensure_not_sensitive(&path, &self.home)?;
+                authorization.require_trash_path(&path)?;
                 self.confirm_or_deny(
                     "move_to_trash",
                     &format!("moving {} to Trash", path.display()),
                 )
                 .await?;
                 filesystem::move_to_trash(&path, &self.home.join(".Trash")).await
-            }
-            "run_shell" => {
-                if !shell::enabled() {
-                    bail!(
-                        "run_shell is disabled by default; set FINN_ENABLE_SHELL=1 before starting Finn to opt in"
-                    );
-                }
-                shell::run(
-                    required_str(&args, "command")?,
-                    &self.home,
-                    required_u64(&args, "timeout_seconds")?,
-                )
-                .await
             }
             "codex_start" => {
                 let workspace = self.named_path_arg(&args, "workspace")?;
@@ -1358,6 +1354,82 @@ fn extract_attachment_hashes(task: &str) -> ([u64; 8], u8) {
     (hashes, count as u8)
 }
 
+fn extract_target_hashes(task: &str) -> ([u64; 16], u8) {
+    let mut hashes = [0_u64; 16];
+    let mut count = 0_usize;
+    let mut add = |candidate: &str| {
+        let candidate = candidate
+            .trim_matches(|character: char| {
+                character.is_whitespace()
+                    || matches!(
+                        character,
+                        '"' | '\'' | ',' | ';' | ':' | '(' | ')' | '[' | ']'
+                    )
+            })
+            .trim_end_matches('/');
+        let name = candidate.rsplit('/').next().unwrap_or(candidate).trim();
+        if name.is_empty() || count >= hashes.len() {
+            return;
+        }
+        let hash = stable_text_hash(&name.to_ascii_lowercase());
+        if !hashes[..count].contains(&hash) {
+            hashes[count] = hash;
+            count += 1;
+        }
+    };
+
+    for token in task.split_whitespace() {
+        let trimmed = token.trim_matches(|character: char| {
+            matches!(
+                character,
+                '"' | '\'' | ',' | ';' | ':' | '(' | ')' | '[' | ']'
+            )
+        });
+        if trimmed.contains('/')
+            || trimmed.rsplit('.').next().is_some_and(|ext| {
+                matches!(
+                    ext.to_ascii_lowercase().as_str(),
+                    "txt"
+                        | "docx"
+                        | "pdf"
+                        | "xlsx"
+                        | "png"
+                        | "jpg"
+                        | "jpeg"
+                        | "gif"
+                        | "webp"
+                        | "tif"
+                        | "tiff"
+                        | "csv"
+                        | "tsv"
+                        | "zip"
+                        | "md"
+                        | "json"
+                        | "xml"
+                        | "html"
+                        | "css"
+                        | "js"
+                        | "rs"
+                        | "py"
+                )
+            })
+        {
+            add(trimmed);
+        }
+    }
+
+    let mut rest = task;
+    while let Some(start) = rest.find('"') {
+        rest = &rest[start + 1..];
+        let Some(end) = rest.find('"') else {
+            break;
+        };
+        add(&rest[..end]);
+        rest = &rest[end + 1..];
+    }
+    (hashes, count as u8)
+}
+
 fn location_flags(text: &TaskText) -> u8 {
     let mut flags = 0_u8;
     if text.has_phrase(&["desktop"]) {
@@ -1443,7 +1515,7 @@ fn required_string_array<'a>(args: &'a Value, name: &str) -> Result<Vec<&'a str>
 }
 
 pub fn definitions() -> Vec<Value> {
-    let mut definitions = vec![
+    let definitions = vec![
         function(
             "path_status",
             "Check whether an exact filesystem path exists and report its type and metadata. Use this for questions such as whether a folder exists.",
@@ -1653,17 +1725,6 @@ pub fn definitions() -> Vec<Value> {
             object_schema(&[("path", string_schema("Exact file or directory path"))]),
         ),
         function(
-            "run_shell",
-            "Run a Bash/Zsh command or script on the Mac. The task itself authorizes execution. Catastrophic commands are blocked.",
-            object_schema(&[
-                ("command", string_schema("Complete zsh command or script")),
-                (
-                    "timeout_seconds",
-                    integer_schema("Timeout from 1 to 600 seconds"),
-                ),
-            ]),
-        ),
-        function(
             "codex_start",
             "Start a bounded Codex CLI agent in one workspace and return its JSONL transcript and session ID. Use only when the user explicitly asks Finn to use or supervise Codex. Inspect codex_status and the transcript before deciding whether to resume.",
             object_schema(&[
@@ -1822,9 +1883,6 @@ pub fn definitions() -> Vec<Value> {
             ]),
         ),
     ];
-    if !shell_enabled() {
-        definitions.retain(|tool| tool.get("name").and_then(Value::as_str) != Some("run_shell"));
-    }
     definitions
 }
 
@@ -2011,8 +2069,8 @@ mod tests {
             ),
             (
                 "χρησιμοποίησε bash και φτιάξε μου 12 φακέλους με τα ονόματα των μηνών στο Desktop και μέσα βάλε 7 txt με τα ονόματα των ημερών",
-                &[DirCreate, FileWrite, FileRead, Shell],
-                &[MailSend, Trash],
+                &[DirCreate, FileWrite, FileRead],
+                &[Shell, MailSend, Trash],
             ),
             // Deletion routes to Trash only for filesystem targets.
             ("Delete note.txt", &[Trash], &[MailSend, Shell]),
@@ -2042,8 +2100,8 @@ mod tests {
             ("Read my email from Alex", &[MailRead], &[MailSend, Shell]),
             (
                 "Please email the report to Alex",
-                &[MailSend],
-                &[Trash, Shell],
+                &[],
+                &[MailSend, Trash, Shell],
             ),
             (
                 "Send \"hello\" to alex@example.com",
@@ -2051,7 +2109,7 @@ mod tests {
                 &[Trash, Shell],
             ),
             ("Read it but do not send any email", &[], &[MailSend]),
-            ("Forward it to Alex", &[MailSend], &[Trash]),
+            ("Forward it to Alex", &[], &[MailSend, Trash]),
             // Attachment save requires an attachment reference or mail deixis.
             (
                 "Save the invoice attached to Alex's email in ~/Documents/Invoices",
@@ -2079,11 +2137,11 @@ mod tests {
                 &[ArtifactWrite, Overwrite],
                 &[MailSend],
             ),
-            // Shell is only granted on an explicit shell request.
+            // General shell execution is unavailable, even when requested.
             (
                 "Run a bash command to list processes",
-                &[Shell],
-                &[MailSend, Trash],
+                &[],
+                &[Shell, MailSend, Trash],
             ),
             (
                 "Summarize my Documents folder",
@@ -2178,12 +2236,11 @@ mod tests {
     #[test]
     fn all_tool_schemas_are_strict_and_named() {
         let tools = definitions();
-        assert_eq!(tools.len(), if shell_enabled() { 25 } else { 24 });
-        assert_eq!(
-            tools
+        assert_eq!(tools.len(), 24);
+        assert!(
+            !tools
                 .iter()
-                .any(|tool| tool["name"].as_str() == Some("run_shell")),
-            shell_enabled()
+                .any(|tool| tool["name"].as_str() == Some("run_shell"))
         );
         for tool in tools {
             assert_eq!(tool["type"], "function");
@@ -2342,7 +2399,7 @@ mod tests {
 
     #[test]
     fn derives_high_impact_authorization_from_original_task() {
-        let mail = TaskAuthorization::from_task("Send the report by email to Alex");
+        let mail = TaskAuthorization::from_task("Send the report to alex@example.com");
         assert!(mail.require_mail_send().is_ok());
         assert!(mail.require_trash().is_err());
 
@@ -2374,13 +2431,13 @@ mod tests {
         assert!(negated.require_mail_send().is_err());
 
         let imperative = TaskAuthorization::from_task("Please email the report to Alex");
-        assert!(imperative.require_mail_send().is_ok());
+        assert!(imperative.require_mail_send().is_err());
 
         let addressed = TaskAuthorization::from_task("Send \"hello\" to alex@example.com");
         assert!(addressed.require_mail_send().is_ok());
 
         let conversational = TaskAuthorization::from_task("Forward it to Alex");
-        assert!(conversational.require_mail_send().is_ok());
+        assert!(conversational.require_mail_send().is_err());
     }
 
     #[test]
@@ -2448,6 +2505,24 @@ mod tests {
 
     #[test]
     fn binds_outbound_mail_to_explicit_recipients_and_attachments() {
+        let clean = TaskAuthorization::from_task("Send report.pdf to safe@example.com");
+        assert!(clean.require_mail_recipient("safe@example.com").is_ok());
+        assert!(
+            clean
+                .require_mail_recipient("attacker@example.com")
+                .is_err()
+        );
+        assert!(
+            clean
+                .require_outbound_attachments(&[PathBuf::from("/tmp/report.pdf")])
+                .is_ok()
+        );
+        assert!(
+            clean
+                .require_outbound_attachments(&[PathBuf::from("/tmp/secret.pdf")])
+                .is_err()
+        );
+
         let authorized =
             TaskAuthorization::from_task("Read the email and send the summary to safe@example.com")
                 .with_untrusted_context(true);
@@ -2490,6 +2565,28 @@ mod tests {
         assert!(
             with_file
                 .require_outbound_attachments(&[PathBuf::from("/tmp/other.pdf")])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn binds_trash_to_an_explicit_target() {
+        let file = TaskAuthorization::from_task("Delete note.txt");
+        assert!(file.require_trash_path(Path::new("/tmp/note.txt")).is_ok());
+        assert!(
+            file.require_trash_path(Path::new("/tmp/other.txt"))
+                .is_err()
+        );
+
+        let folder = TaskAuthorization::from_task("Move \"Old Reports\" to Trash");
+        assert!(
+            folder
+                .require_trash_path(Path::new("/tmp/Old Reports"))
+                .is_ok()
+        );
+        assert!(
+            folder
+                .require_trash_path(Path::new("/tmp/Current Reports"))
                 .is_err()
         );
     }
@@ -2664,7 +2761,7 @@ mod tests {
                 authorization,
             )
             .await;
-        assert!(shell.contains("untrusted external data"));
+        assert!(shell.contains("run_shell is unavailable"));
         assert!(!shell_target.exists());
 
         let send = context

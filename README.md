@@ -2,7 +2,7 @@
 
 Finn is a Rust-based macOS assistant that executes natural-language tasks through OpenRouter.
 
-Finn does not hand generated commands back to the user. An imperative task is authorization to execute the requested action. Questions remain read-only, deletion moves items to Trash, and catastrophic shell patterns are blocked.
+Finn does not hand generated commands back to the user. An imperative task is authorization to execute the requested action. Questions remain read-only, deletion moves explicitly named items to Trash, and general shell execution is unavailable.
 
 ## Capabilities
 
@@ -54,7 +54,7 @@ Then speak naturally:
 ```text
 create a folder named Makis on my Desktop
 does the folder named Makis exist on my Desktop?
-move that folder to Trash
+move ~/Desktop/Makis to Trash
 find PDF invoices in my Downloads folder
 write a zsh script on my Desktop that reports the ten largest files
 find emails from example.com in my inbox
@@ -128,7 +128,6 @@ cargo run --release -- --check
 | `FINN_REASONING` | `medium` | OpenRouter reasoning configuration |
 | `FINN_HOME` | `~/Library/Application Support/FinnAgent` | Local task log directory |
 | `FINN_TASK_LOG` | `off` | Set to `1`, `true`, `yes`, or `on` to retain local task summaries |
-| `FINN_ENABLE_SHELL` | `off` | Opt in to `run_shell`; still requires an explicit shell request and an untainted session |
 | `FINN_MAIL_SENDER` | first enabled account | Preferred Apple Mail sender address; defaults to the first enabled Apple Mail account |
 
 OpenRouter setup:
@@ -148,13 +147,12 @@ cargo run --release
 5. Finn reports the verified result.
 
 No shell command suggested by the model is executed directly by the API. Every
-action passes through the Rust tool router. General shell execution is omitted
-from the model's tools unless `FINN_ENABLE_SHELL=1`; when enabled it requires an
-explicit shell request, skips startup files, and receives a minimal environment
-without provider API keys.
+action passes through a dedicated Rust tool handler. General shell execution is
+unavailable; local actions use bounded filesystem, artifact, Mail, download, and
+system-information tools.
 
-Codex CLI delegation uses separate `codex_start` and `codex_resume` tools rather
-than `run_shell`. When the user explicitly asks Finn to use or supervise Codex,
+Codex CLI delegation uses separate `codex_start` and `codex_resume` tools. When
+the user explicitly asks Finn to use or supervise Codex,
 Finn starts `codex exec --json` in a workspace below the user's home, reads the
 JSONL transcript and session ID, and may make up to eight focused resume calls.
 Codex runs with its `workspace-write` sandbox, provider API keys are removed from
@@ -204,15 +202,16 @@ there rather than performed unconfirmed. See [SECURITY.md](SECURITY.md) for the
 enforced threat boundary and explicit non-guarantees.
 
 Mutation tools require authorization derived from the current user request.
-File deletion uses Trash. Rust independently checks authorization for shell
-execution, filesystem and artifact writes, email sending, attachment saving,
-overwriting, and moving items to Trash; model instructions alone cannot grant
-those capabilities.
+File deletion uses Trash and is bound to an explicit filename, quoted name, or
+path basename from the task. Rust independently checks authorization for
+filesystem and artifact writes, email sending, attachment saving, overwriting,
+and moving items to Trash; model instructions alone cannot grant those
+capabilities.
 
 When `FINN_TASK_LOG` is enabled, each task record includes a structured
-authorization snapshot: derived capabilities, bound recipient/attachment counts,
-standard locations named by the user, untrusted-context state, and the tool
-schemas exposed for the initial model round. Each recorded tool event also
+authorization snapshot: derived capabilities, bound recipient, attachment, and
+target counts, standard locations named by the user, untrusted-context state,
+and the tool schemas exposed for the initial model round. Each recorded tool event also
 includes its status, denial detail when applicable, and whether interactive
 confirmation was required.
 
@@ -222,16 +221,15 @@ while execution-time checks independently reject tool calls returned outside
 that set. Every tool result is JSON-wrapped in a machine-generated
 `untrusted_external_data` envelope before it is returned to the model.
 
-Reads, writes, attachments, and shell access to `.ssh`, `.gnupg`, AWS
-credentials, shell startup files, Apple Mail storage, and macOS Keychains are
+Reads, writes, and attachments involving `.ssh`, `.gnupg`, AWS credentials,
+shell startup files, Apple Mail storage, and macOS Keychains are
 blocked, including access through resolvable symlinks. Task logs are off by
 default; opted-in logs use user-only `0600` permissions.
 
-Successful reads of filenames, files, artifacts, images, shell output, or Mail
+Successful reads of filenames, files, artifacts, images, Codex output, or Mail
 data activate a programmatic least-privilege mode for the rest of the session.
-Shell execution is then disabled. Other mutations require explicit authorization
-in the current user request. Instructions inside external content cannot grant
-those capabilities.
+Mutations require explicit authorization in the current user request.
+Instructions inside external content cannot grant those capabilities.
 
 The mode remains active until Finn exits. Outbound mail is bound to email
 addresses explicitly written in the current task. Outbound attachment names and
@@ -249,8 +247,9 @@ ask Finn to process.
 
 Artifact processing is local and capped at 100 MB per input. DOCX/XLSX archives
 also have entry-count, per-entry, and total expanded-size limits; image decoding
-has dimension and allocation limits. DOCX creation is
-intended for straightforward reports and notes; complex layout editing is not a
+has dimension and allocation limits. Before DOCX/XLSX parsing, every XML entry
+is scanned linearly and rejects tags above 64 KiB or 256 attributes. DOCX
+creation is intended for straightforward reports and notes; complex layout editing is not a
 replacement for Microsoft Word. DOCX text replacement preserves the package but
 matches text within individual Word runs. PDF text replacement works only for
 text represented by supported PDF text operations and fonts. XLSX formulas are
