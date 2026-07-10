@@ -429,6 +429,36 @@ fn is_user_message(message: &Message) -> bool {
     message.role == Role::User
 }
 
+/// Merges one streamed reasoning-detail fragment into the accumulated block
+/// for its index. Text-bearing fields concatenate; every other field takes the
+/// latest non-null value, so a trailing signature-only fragment completes the
+/// block it belongs to.
+fn merge_reasoning_fragment(slot: &mut Value, fragment: &Value) {
+    let Some(fragment) = fragment.as_object() else {
+        return;
+    };
+    if slot.is_null() {
+        *slot = Value::Object(fragment.clone());
+        return;
+    }
+    let Some(existing) = slot.as_object_mut() else {
+        return;
+    };
+    for (key, value) in fragment {
+        if value.is_null() || key == "index" {
+            continue;
+        }
+        if matches!(key.as_str(), "text" | "summary" | "data")
+            && let (Some(Value::String(current)), Some(addition)) =
+                (existing.get_mut(key.as_str()), value.as_str())
+        {
+            current.push_str(addition);
+            continue;
+        }
+        existing.insert(key.clone(), value.clone());
+    }
+}
+
 /// Reassembles a non-streaming Chat Completions response object from an SSE
 /// stream. Assistant content is forwarded to `sink` only after the complete
 /// message is known, so text-form pseudo tool calls are not leaked as answers.
@@ -440,7 +470,9 @@ async fn accumulate_stream(
     let mut id = String::new();
     let mut content = String::new();
     let mut reasoning = String::new();
-    let mut reasoning_details: Vec<Value> = Vec::new();
+    let mut indexed_reasoning_details: std::collections::BTreeMap<u64, Value> =
+        std::collections::BTreeMap::new();
+    let mut unindexed_reasoning_details: Vec<Value> = Vec::new();
     let mut annotations: Vec<Value> = Vec::new();
     let mut tool_calls: Vec<ToolCallAccumulator> = Vec::new();
     let mut usage = Value::Null;
@@ -472,7 +504,22 @@ async fn accumulate_stream(
             reasoning.push_str(text);
         }
         if let Some(details) = delta.get("reasoning_details").and_then(Value::as_array) {
-            reasoning_details.extend(details.iter().cloned());
+            // Streamed reasoning details arrive as indexed fragments of the
+            // same block, exactly like tool-call deltas. They must be merged
+            // per index before replay: providers that sign their reasoning
+            // blocks (Anthropic) reject a history where one block was stored
+            // as dozens of fragments.
+            for fragment in details {
+                match fragment.get("index").and_then(Value::as_u64) {
+                    Some(index) => merge_reasoning_fragment(
+                        indexed_reasoning_details
+                            .entry(index)
+                            .or_insert(Value::Null),
+                        fragment,
+                    ),
+                    None => unindexed_reasoning_details.push(fragment.clone()),
+                }
+            }
         }
         if let Some(items) = delta.get("annotations").and_then(Value::as_array) {
             annotations.extend(items.iter().cloned());
@@ -528,6 +575,10 @@ async fn accumulate_stream(
     if !reasoning.is_empty() {
         message.insert("reasoning".to_owned(), Value::String(reasoning));
     }
+    let reasoning_details = indexed_reasoning_details
+        .into_values()
+        .chain(unindexed_reasoning_details)
+        .collect::<Vec<_>>();
     if !reasoning_details.is_empty() {
         message.insert(
             "reasoning_details".to_owned(),
@@ -1017,6 +1068,49 @@ mod tests {
             "{\"path\":\"~\"}"
         );
         assert_eq!(response.response["usage"]["total_tokens"], 5);
+        server.await.unwrap();
+    }
+
+    /// Streamed reasoning details are indexed fragments of the same block and
+    /// must be reassembled before replay: providers that sign reasoning blocks
+    /// reject histories where one block is stored as many fragments.
+    #[tokio::test]
+    async fn merges_streamed_reasoning_detail_fragments_by_index() {
+        let events = test_support::sse_body(&[
+            json!({"id": "gen_r", "choices": [{"delta": {"reasoning_details": [
+                {"index": 0, "type": "reasoning.text", "text": "First I will ", "format": "anthropic-claude-v1"}
+            ]}}]}),
+            json!({"id": "gen_r", "choices": [{"delta": {"reasoning_details": [
+                {"index": 0, "type": "reasoning.text", "text": "check the path."}
+            ]}}]}),
+            json!({"id": "gen_r", "choices": [{"delta": {"reasoning_details": [
+                {"index": 0, "type": "reasoning.text", "signature": "sig-abc"}
+            ]}}]}),
+            json!({"id": "gen_r", "choices": [{"delta": {"content": "done"}}]}),
+        ]);
+        let (base_url, server) = test_support::mock_http_server(vec![("200 OK", events)]).await;
+        let orchestrator = FinnOrchestrator::with_host_context(config(base_url), host());
+        orchestrator.push_user("check home");
+        let mut sink = |_: &str| {};
+        let response = orchestrator
+            .create_turn(
+                &Client::new(),
+                |_| "instructions".to_owned(),
+                Vec::new(),
+                &mut sink,
+            )
+            .await
+            .unwrap();
+
+        let details = response
+            .response
+            .pointer("/choices/0/message/reasoning_details")
+            .and_then(Value::as_array)
+            .unwrap();
+        assert_eq!(details.len(), 1, "fragments must merge into one block");
+        assert_eq!(details[0]["text"], "First I will check the path.");
+        assert_eq!(details[0]["signature"], "sig-abc");
+        assert_eq!(details[0]["format"], "anthropic-claude-v1");
         server.await.unwrap();
     }
 

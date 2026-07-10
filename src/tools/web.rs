@@ -57,7 +57,29 @@ pub async fn download_url(raw_url: &str, destination: &Path, overwrite: bool) ->
     }
     let response = response.context("download did not produce a response")?;
     if response.status() != StatusCode::OK {
-        bail!("download returned HTTP {}", response.status());
+        bail!(
+            "download returned HTTP {} for {}; the URL must be a direct, publicly accessible link to the file itself, not a page that displays it",
+            response.status(),
+            response.url()
+        );
+    }
+    // A 200 with an HTML body is almost always a page URL pasted where an
+    // asset URL belongs. Telling the model exactly that lets it self-correct
+    // in one round instead of retrying variations of the same mistake.
+    let html_destination = destination
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| matches!(extension.to_ascii_lowercase().as_str(), "html" | "htm"));
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if content_type.starts_with("text/html") && !html_destination {
+        bail!(
+            "the URL returned a web page (text/html), not a downloadable file; find the direct asset URL — for images it usually ends in .jpg, .png, or .webp — and retry"
+        );
     }
     if response
         .headers()

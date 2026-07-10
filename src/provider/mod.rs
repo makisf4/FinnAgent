@@ -201,15 +201,34 @@ pub(crate) mod test_support {
 }
 
 pub(super) fn api_error_message(body: &str) -> String {
-    serde_json::from_str::<Value>(body)
-        .ok()
-        .and_then(|value| {
-            value
-                .pointer("/error/message")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        })
-        .unwrap_or_else(|| body.chars().take(500).collect())
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return body.chars().take(500).collect();
+    };
+    let Some(message) = value.pointer("/error/message").and_then(Value::as_str) else {
+        return body.chars().take(500).collect();
+    };
+    // OpenRouter wraps upstream failures in a generic message and preserves
+    // the provider's own error in metadata; surface it, or diagnosing
+    // provider-specific request rejections is guesswork.
+    let provider = value
+        .pointer("/error/metadata/provider_name")
+        .and_then(Value::as_str);
+    let raw = value
+        .pointer("/error/metadata/raw")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|raw| !raw.is_empty() && *raw != message);
+    match (provider, raw) {
+        (Some(provider), Some(raw)) => {
+            format!("{message} ({provider}: {})", truncate_chars(raw, 400))
+        }
+        (None, Some(raw)) => format!("{message} ({})", truncate_chars(raw, 400)),
+        _ => message.to_owned(),
+    }
+}
+
+fn truncate_chars(text: &str, limit: usize) -> String {
+    text.chars().take(limit).collect()
 }
 
 #[cfg(test)]
@@ -233,5 +252,23 @@ mod retry_tests {
             .unwrap();
         assert!(response.status().is_success());
         assert_eq!(server.await.unwrap().len(), 3);
+    }
+
+    #[test]
+    fn api_error_message_surfaces_provider_detail() {
+        // OpenRouter wraps upstream failures generically; the provider's own
+        // error lives in metadata and must be surfaced for diagnosis.
+        let wrapped = r#"{"error":{"message":"Provider returned error","code":400,
+            "metadata":{"provider_name":"Anthropic",
+            "raw":"messages.2.content.0: unexpected `text` block"}}}"#;
+        assert_eq!(
+            api_error_message(wrapped),
+            "Provider returned error (Anthropic: messages.2.content.0: unexpected `text` block)"
+        );
+
+        let plain = r#"{"error":{"message":"invalid api key"}}"#;
+        assert_eq!(api_error_message(plain), "invalid api key");
+
+        assert_eq!(api_error_message("not json"), "not json");
     }
 }

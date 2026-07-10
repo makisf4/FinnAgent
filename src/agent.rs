@@ -23,6 +23,9 @@ const ROUNDS_PER_BATCH: usize = 12;
 const CALLS_PER_BATCH: u64 = 48;
 const MAX_TASK_TOKENS: u64 = 200_000;
 const MAX_IDENTICAL_TOOL_CALLS: u8 = 2;
+/// Consecutive failures of one tool (any arguments) before Finn stops the
+/// batch and asks the user instead of letting the model thrash.
+const MAX_CONSECUTIVE_TOOL_FAILURES: u8 = 4;
 const LOCAL_PHASE_CONTINUATION: &str = "Continue the user's original task now. The requested web research phase is complete. Use the currently available authorized local tools to perform and verify the requested local work. Do not repeat the web research, do not merely describe tool calls, and do not claim local tools are unavailable.";
 
 const INSTRUCTIONS: &str = r#"
@@ -338,6 +341,7 @@ impl Agent {
         let mut tool_events = Vec::new();
         let mut models_used = Vec::new();
         let mut repeated_calls = HashMap::<String, u8>::new();
+        let mut consecutive_failures = HashMap::<String, u8>::new();
 
         let mut round_budget = ROUNDS_PER_BATCH;
         let mut call_budget = CALLS_PER_BATCH;
@@ -524,6 +528,34 @@ impl Agent {
                         &call.id,
                         &crate::tools::model_tool_result(&call.name, &result),
                     );
+                    // Distinct-argument retries evade the identical-call cap,
+                    // so a separate consecutive-failure cap stops a model that
+                    // thrashes one tool with a stream of new bad inputs.
+                    let failures = consecutive_failures.entry(call.name.clone()).or_default();
+                    if status == "complete" {
+                        *failures = 0;
+                    } else {
+                        *failures = failures.saturating_add(1);
+                    }
+                    if *failures >= MAX_CONSECUTIVE_TOOL_FAILURES {
+                        spinner.pause_for_prompt().await;
+                        let keep_going = self
+                            .tools
+                            .ask(&format!(
+                                "{} has failed {failures} times in a row. Keep letting Finn retry it?",
+                                call.name
+                            ))
+                            .await;
+                        if keep_going {
+                            spinner.resume();
+                            *failures = 0;
+                        } else {
+                            bail!(
+                                "Finn stopped after {MAX_CONSECUTIVE_TOOL_FAILURES} consecutive failed {} calls.",
+                                call.name
+                            );
+                        }
+                    }
                 }
                 round_index += 1;
                 continue;
@@ -908,6 +940,8 @@ mod tests {
         // session must stop with a clear "without finishing" message rather
         // than loop forever, and it must not exceed one batch of rounds.
         let directory = tempfile::tempdir().unwrap();
+        let desktop = directory.path().join("Desktop");
+        tokio::fs::create_dir_all(&desktop).await.unwrap();
         let responses = (0..ROUNDS_PER_BATCH)
             .map(|index| {
                 let body = test_support::sse_chat(
@@ -917,10 +951,13 @@ mod tests {
                         "type": "function",
                         "function": {
                             "name": "path_status",
-                            // Distinct paths keep the identical-call guard from
-                            // firing before the batch boundary is reached.
+                            // Distinct Desktop paths keep the identical-call and
+                            // consecutive-failure guards from firing before the
+                            // batch boundary is reached: the reads stay
+                            // authorized (and successful) under the tainted
+                            // session because the task names the Desktop.
                             "arguments": json!({
-                                "path": directory.path().join(format!("probe_{index}")).to_string_lossy()
+                                "path": desktop.join(format!("probe_{index}")).to_string_lossy()
                             }).to_string()
                         }
                     }]}),
@@ -949,7 +986,7 @@ mod tests {
         let mut agent = Agent::new(config, tools).unwrap();
 
         let error = agent
-            .run_task("inspect the file at each path one by one")
+            .run_task("inspect the file at each path on my Desktop one by one")
             .await
             .unwrap_err()
             .to_string();
@@ -960,6 +997,70 @@ mod tests {
 
         let requests = server.await.unwrap();
         assert_eq!(requests.len(), ROUNDS_PER_BATCH);
+    }
+
+    /// A model thrashing one tool with ever-different bad arguments evades the
+    /// identical-call cap; the consecutive-failure cap must stop it instead.
+    #[tokio::test]
+    async fn stops_a_tool_that_keeps_failing_with_distinct_arguments() {
+        let directory = tempfile::tempdir().unwrap();
+        // Exactly the rounds the run will consume: one tainting success, then
+        // MAX_CONSECUTIVE_TOOL_FAILURES denials that trip the cap.
+        let rounds = 1 + MAX_CONSECUTIVE_TOOL_FAILURES as usize;
+        let responses = (0..rounds)
+            .map(|index| {
+                let body = test_support::sse_chat(
+                    &format!("resp_{index}"),
+                    json!({"tool_calls": [{
+                        "id": format!("call_{index}"),
+                        "type": "function",
+                        "function": {
+                            "name": "path_status",
+                            // The first probe succeeds and taints the session;
+                            // the rest are denied (unauthorized location under
+                            // taint), each with distinct arguments.
+                            "arguments": json!({
+                                "path": directory.path().join(format!("probe_{index}")).to_string_lossy()
+                            }).to_string()
+                        }
+                    }]}),
+                );
+                ("200 OK", body)
+            })
+            .collect::<Vec<_>>();
+        let (base_url, server) = test_support::mock_http_server(responses).await;
+        let config = Config {
+            api_key: "test-key".to_owned(),
+            base_url,
+            model: "gpt-test".to_owned(),
+            model_kind: crate::config::ModelKind::Assistant,
+            vision_model: None,
+            reasoning_effort: "medium".to_owned(),
+            home: directory.path().to_path_buf(),
+            data_dir: directory.path().join("data"),
+        };
+        tokio::fs::create_dir_all(&config.data_dir).await.unwrap();
+        let tools = ToolContext::new(
+            config.home.clone(),
+            config.data_dir.clone(),
+            crate::tools::Confirmer::AutoDeny,
+        );
+        let mut agent = Agent::new(config, tools).unwrap();
+
+        let error = agent
+            .run_task("inspect the file at each path one by one")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("consecutive failed path_status calls"),
+            "unexpected error: {error}"
+        );
+
+        // One success plus MAX_CONSECUTIVE_TOOL_FAILURES failures were sent
+        // before the cap fired mid-round.
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), rounds, "cap must stop the loop mid-batch");
     }
 
     #[tokio::test]
