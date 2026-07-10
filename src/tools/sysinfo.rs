@@ -64,8 +64,9 @@ pub async fn report(section: &str) -> Result<String> {
     }
 
     if want("disk") {
-        // `df -k /` reports the root volume in 1024-byte blocks. Parsing the
-        // fixed columns avoids relying on locale-specific human formatting.
+        // `df -k /` reports the root APFS container in 1024-byte blocks.
+        // Parsing the fixed columns avoids relying on locale-specific human
+        // formatting.
         let df = run("/bin/df", &["-k", "/"]).await;
         out.push_str("[disk]\n");
         out.push_str(&format!("{}\n", format_disk(&df)));
@@ -83,19 +84,35 @@ fn format_disk(df_output: &str) -> String {
     if fields.len() >= 5 {
         let kib = |value: &str| value.parse::<u64>().ok().map(|blocks| blocks * 1024);
         let total = kib(fields[1]);
-        let used = kib(fields[2]);
         let available = kib(fields[3]);
         let mut lines = Vec::new();
         if let Some(total) = total {
             lines.push(format!("volume: / total: {}", human_bytes(total)));
         }
+        // On macOS, `/` is a sealed APFS system volume. Its `df` Used column
+        // only describes that volume (mostly the OS), while total and
+        // available reflect the shared APFS container. Derive occupied space
+        // from the container-wide values so Data, VM, snapshots, and the
+        // other volumes are included.
+        let used = total
+            .zip(available)
+            .map(|(total, available)| total.saturating_sub(available));
         if let Some(used) = used {
             lines.push(format!("used: {}", human_bytes(used)));
         }
         if let Some(available) = available {
             lines.push(format!("available: {}", human_bytes(available)));
         }
-        lines.push(format!("capacity: {}", fields[4]));
+        if let (Some(used), Some(total)) = (used, total) {
+            let percent = if total == 0 {
+                0
+            } else {
+                ((u128::from(used) * 100).div_ceil(u128::from(total))) as u64
+            };
+            lines.push(format!("capacity: {percent}%"));
+        } else {
+            lines.push(format!("capacity: {}", fields[4]));
+        }
         return lines.join("\n");
     }
     format!("raw: {df_output}")
@@ -151,10 +168,20 @@ mod tests {
     fn parses_df_columns() {
         let df = "Filesystem 1024-blocks      Used Available Capacity  iused ifree %iused  Mounted on\n/dev/disk3s1s1 971350180 20000000 900000000    3%    500 4000000    0%   /";
         let formatted = format_disk(df);
-        assert!(formatted.contains("volume: / total:"));
-        assert!(formatted.contains("used:"));
-        assert!(formatted.contains("available:"));
-        assert!(formatted.contains("capacity: 3%"));
+        assert!(formatted.contains("volume: / total: 926.4 GB"));
+        assert!(formatted.contains("used: 68.0 GB"));
+        assert!(formatted.contains("available: 858.3 GB"));
+        assert!(formatted.contains("capacity: 8%"));
+    }
+
+    #[test]
+    fn derives_apfs_container_usage_instead_of_root_volume_usage() {
+        let df = "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/disk3s5s1 239362496 12150368 77294952 14% /";
+        let formatted = format_disk(df);
+
+        assert!(formatted.contains("used: 154.6 GB"));
+        assert!(formatted.contains("capacity: 68%"));
+        assert!(!formatted.contains("used: 11.6 GB"));
     }
 
     #[test]
