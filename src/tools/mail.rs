@@ -11,6 +11,8 @@ use tokio::time::timeout;
 
 const MAIL_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_MAIL_OUTPUT: usize = 128 * 1024;
+const RECENT_ATTACHMENT_SCAN_LIMIT: usize = 2_000;
+const RECENT_ATTACHMENT_CANDIDATE_LIMIT: usize = 25;
 
 pub async fn search(query: &str, mailbox_scope: &str, limit: usize) -> Result<String> {
     validate_mailbox_scope(mailbox_scope)?;
@@ -33,7 +35,12 @@ on run argv
             else
                 set sourceMailbox to drafts mailbox
             end if
-            repeat with messageItem in messages of sourceMailbox
+            if queryText is "" then
+                set matchingMessages to messages of sourceMailbox
+            else
+                set matchingMessages to (every message of sourceMailbox whose (subject contains queryText or sender contains queryText))
+            end if
+            repeat with messageItem in matchingMessages
                 set messageSubject to subject of messageItem
                 set messageSender to sender of messageItem
                 if messageSubject contains queryText or messageSender contains queryText then
@@ -64,6 +71,124 @@ end joinLines
         format!("no matching messages in {mailbox_scope}")
     } else {
         format!("mailbox: {mailbox_scope}\nid\tsender\tsubject\tdate\tattachments\n{output}")
+    })
+}
+
+pub async fn recent_attachments(
+    query: &str,
+    extension: &str,
+    mailbox_scope: &str,
+    limit: usize,
+) -> Result<String> {
+    validate_mailbox_scope(mailbox_scope)?;
+    validate_attachment_extension(extension)?;
+    let invoice_query = invoice_like_query(query).to_string();
+    let script = r#"
+on run argv
+    set queryText to item 1 of argv
+    set extensionText to item 2 of argv
+    set mailboxScope to item 3 of argv
+    set resultLimit to (item 4 of argv) as integer
+    set scanLimit to (item 5 of argv) as integer
+    set candidateLimit to (item 6 of argv) as integer
+    set invoiceQuery to (item 7 of argv) is "true"
+    set matchingLines to {}
+    set fallbackLines to {}
+    ignoring case
+        tell application "Mail"
+            if mailboxScope is "inbox" then
+                set sourceMailbox to inbox
+            else if mailboxScope is "trash" then
+                set sourceMailbox to trash mailbox
+            else if mailboxScope is "junk" then
+                set sourceMailbox to junk mailbox
+            else if mailboxScope is "sent" then
+                set sourceMailbox to sent mailbox
+            else
+                set sourceMailbox to drafts mailbox
+            end if
+
+            set allMessages to messages of sourceMailbox
+            set scanCount to count of allMessages
+            if scanCount is greater than scanLimit then set scanCount to scanLimit
+            if scanCount is 0 then return ""
+            set messageItems to items 1 through scanCount of allMessages
+
+            repeat with messageItem in messageItems
+                set messageSubject to subject of messageItem
+                set messageSender to sender of messageItem
+                set messageDate to date received of messageItem
+                set messageId to id of messageItem
+                set messageMatches to ((queryText is "") or (messageSubject contains queryText) or (messageSender contains queryText))
+                if invoiceQuery and ((messageSubject contains "invoice") or (messageSubject contains "τιμολ") or (messageSubject contains "απυ") or (messageSubject contains "receipt") or (messageSubject contains "παραστατ") or (messageSubject contains "απόδειξ") or (messageSubject contains "αποδείξ")) then set messageMatches to true
+                set attachmentItems to mail attachments of messageItem
+                repeat with attachmentIndex from 1 to count of attachmentItems
+                    set attachmentItem to item attachmentIndex of attachmentItems
+                    set attachmentName to name of attachmentItem
+                    set extensionMatches to ((extensionText is "any") or (attachmentName ends with ("." & extensionText)))
+                    set queryMatches to (messageMatches or (attachmentName contains queryText))
+                    if invoiceQuery and ((attachmentName contains "invoice") or (attachmentName contains "τιμολ") or (attachmentName contains "απυ") or (attachmentName contains "receipt") or (attachmentName contains "παραστατ") or (attachmentName contains "απόδειξ") or (attachmentName contains "αποδείξ")) then set queryMatches to true
+                    if extensionMatches then
+                        set attachmentSize to 0
+                        set isDownloaded to false
+                        try
+                            set attachmentSize to file size of attachmentItem
+                        end try
+                        try
+                            set isDownloaded to downloaded of attachmentItem
+                        end try
+                        set rowText to (queryMatches as text) & tab & (messageId as text) & tab & messageSender & tab & messageSubject & tab & (messageDate as text) & tab & (attachmentIndex as text) & tab & attachmentName & tab & (attachmentSize as text) & tab & (isDownloaded as text)
+                        if queryMatches then
+                            set end of matchingLines to rowText
+                        else
+                            set end of fallbackLines to rowText
+                        end if
+                        if (count of matchingLines) is greater than or equal to resultLimit then exit repeat
+                        if ((count of matchingLines) + (count of fallbackLines)) is greater than or equal to candidateLimit then exit repeat
+                    end if
+                end repeat
+                if (count of matchingLines) is greater than or equal to resultLimit then exit repeat
+                if ((count of matchingLines) + (count of fallbackLines)) is greater than or equal to candidateLimit then exit repeat
+            end repeat
+        end tell
+    end ignoring
+    return joinLines(matchingLines & fallbackLines)
+end run
+
+on joinLines(itemsList)
+    set oldDelimiters to AppleScript's text item delimiters
+    set AppleScript's text item delimiters to linefeed
+    set joinedText to itemsList as text
+    set AppleScript's text item delimiters to oldDelimiters
+    return joinedText
+end joinLines
+"#;
+    let output = run_osascript(
+        script,
+        &[
+            query,
+            extension,
+            mailbox_scope,
+            &limit.clamp(1, 20).to_string(),
+            &RECENT_ATTACHMENT_SCAN_LIMIT.to_string(),
+            &RECENT_ATTACHMENT_CANDIDATE_LIMIT.to_string(),
+            &invoice_query,
+        ],
+    )
+    .await?;
+    Ok(if output.trim().is_empty() {
+        format!(
+            "no matching {extension} attachments among the {RECENT_ATTACHMENT_SCAN_LIMIT} most recent messages in {mailbox_scope}"
+        )
+    } else {
+        let candidate_count = output.lines().count();
+        let query_match_count = output
+            .lines()
+            .filter(|line| line.starts_with("true\t"))
+            .count();
+        format!(
+            "mailbox: {mailbox_scope}\nquery_matches: {query_match_count}\ncandidates: {candidate_count}\nscan: newest-first; stops after {limit} query matches or {RECENT_ATTACHMENT_CANDIDATE_LIMIT} recent attachment candidates, with a hard cap of {RECENT_ATTACHMENT_SCAN_LIMIT} messages\nquery_match\tmessage_id\tsender\tsubject\tdate\tattachment_index\tattachment_name\tsize_bytes\tdownloaded\n{output}"
+        )
     })
 }
 
@@ -339,6 +464,33 @@ fn validate_mailbox_scope(scope: &str) -> Result<()> {
     }
 }
 
+fn validate_attachment_extension(extension: &str) -> Result<()> {
+    if matches!(
+        extension,
+        "any" | "pdf" | "doc" | "docx" | "xls" | "xlsx" | "csv" | "png" | "jpg" | "jpeg"
+    ) {
+        Ok(())
+    } else {
+        bail!("unsupported attachment extension '{extension}'")
+    }
+}
+
+fn invoice_like_query(query: &str) -> bool {
+    let query = query.to_lowercase();
+    [
+        "invoice",
+        "receipt",
+        "τιμολ",
+        "απυ",
+        "παραστατ",
+        "απόδειξ",
+        "αποδείξ",
+        "αποδειξ",
+    ]
+    .iter()
+    .any(|keyword| query.contains(keyword))
+}
+
 async fn validate_save_destination(path: &Path, overwrite: bool) -> Result<()> {
     let parent = path
         .parent()
@@ -410,7 +562,12 @@ async fn run_osascript(script: &str, args: &[&str]) -> Result<String> {
 
     let output = timeout(MAIL_TIMEOUT, child.wait_with_output())
         .await
-        .context("Apple Mail operation timed out")??;
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "MAIL_TIMEOUT: Apple Mail did not respond within {} seconds",
+                MAIL_TIMEOUT.as_secs()
+            )
+        })??;
     let stdout = clipped(&output.stdout);
     let stderr = clipped(&output.stderr);
     if !output.status.success() {
@@ -491,5 +648,37 @@ mod tests {
         }
         assert!(validate_mailbox_scope("all").is_err());
         assert!(validate_mailbox_scope("INBOX").is_err());
+    }
+
+    #[test]
+    fn validates_recent_attachment_extensions() {
+        for extension in ["any", "pdf", "docx", "xlsx", "csv", "png", "jpg", "jpeg"] {
+            assert!(validate_attachment_extension(extension).is_ok());
+        }
+        assert!(validate_attachment_extension("PDF").is_err());
+        assert!(validate_attachment_extension("zip").is_err());
+    }
+
+    #[test]
+    fn recognizes_invoice_queries_in_english_and_greek() {
+        for query in [
+            "invoice",
+            "latest invoices",
+            "τιμολόγια",
+            "ΑΠΥ",
+            "αποδείξεις",
+        ] {
+            assert!(invoice_like_query(query));
+        }
+        assert!(!invoice_like_query("project report"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a configured Apple Mail account and Automation permission"]
+    async fn finds_recent_pdf_attachments_in_live_mail() {
+        let result = recent_attachments("τιμολόγια", "pdf", "inbox", 5)
+            .await
+            .unwrap();
+        assert!(result.contains("query_match\tmessage_id\tsender\tsubject\tdate"));
     }
 }

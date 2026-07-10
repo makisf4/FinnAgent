@@ -293,6 +293,38 @@ pub fn definitions() -> Vec<Value> {
             ]),
         ),
         function(
+            "mail_recent_attachments",
+            "Find and rank the newest Apple Mail attachments without scanning the whole mailbox. Use this for latest/recent attachments or a file type such as PDF. Exact query matches are listed first; bounded recent candidates follow when there are not enough exact matches. Returns message IDs and 1-based attachment indexes for mail_save_attachment.",
+            object_schema(&[
+                (
+                    "query",
+                    string_schema(
+                        "Optional sender, subject, or attachment-name fragment; use an empty string to match any",
+                    ),
+                ),
+                (
+                    "extension",
+                    enum_string_schema(
+                        "Attachment file extension",
+                        &[
+                            "any", "pdf", "doc", "docx", "xls", "xlsx", "csv", "png", "jpg", "jpeg",
+                        ],
+                    ),
+                ),
+                (
+                    "mailbox",
+                    enum_string_schema(
+                        "Mailbox to scan newest-first",
+                        &["inbox", "trash", "junk", "sent", "drafts"],
+                    ),
+                ),
+                (
+                    "limit",
+                    integer_schema("Maximum matching attachments, from 1 to 20"),
+                ),
+            ]),
+        ),
+        function(
             "mail_read",
             "Read an Apple Mail message by the numeric ID and mailbox returned from mail_search.",
             object_schema(&[
@@ -328,7 +360,7 @@ pub fn definitions() -> Vec<Value> {
         ),
         function(
             "mail_save_attachment",
-            "Save one Apple Mail attachment to an exact local file path. Call mail_list_attachments first and pass the same mailbox.",
+            "Save one Apple Mail attachment to an exact local file path. Use an index returned by mail_recent_attachments, or call mail_list_attachments first, and pass the same mailbox.",
             object_schema(&[
                 (
                     "message_id",
@@ -461,7 +493,7 @@ mod tests {
     #[test]
     fn all_tool_schemas_are_strict_and_named() {
         let tools = definitions();
-        assert_eq!(tools.len(), 24);
+        assert_eq!(tools.len(), 25);
         assert!(
             !tools
                 .iter()

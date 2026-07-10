@@ -399,14 +399,17 @@ pub fn clear_screen() {
     let _ = io::stdout().flush();
 }
 
-/// Builds a readline prompt string. ANSI codes are wrapped in the `\x01`/`\x02`
-/// markers rustyline uses to exclude non-printing bytes from width counting.
+/// Builds the plain prompt passed to rustyline. It must not contain ANSI or
+/// other control bytes: rustyline calculates wrapping and cursor positions
+/// from this exact string, especially after SIGWINCH terminal resizes.
 pub fn prompt(label: &str) -> String {
-    if color_enabled() {
-        format!("\x01{CYAN}\x02{label} ›\x01{RESET}\x02 ")
-    } else {
-        format!("{label} > ")
-    }
+    format!("{label} › ")
+}
+
+/// Applies prompt color through rustyline's Highlighter API. The highlighted
+/// form has the same visible width as [`prompt`], which keeps redraws correct.
+pub fn highlight_prompt(prompt: &str) -> String {
+    style(prompt, CYAN)
 }
 
 pub fn render_tool_call(index: u64, name: &str, status: &str) {
@@ -426,6 +429,27 @@ pub fn render_tool_call(index: u64, name: &str, status: &str) {
             style(&format!("  {status}"), glyph_color)
         }
     );
+}
+
+pub fn render_tool_error(detail: &str) {
+    println!("    {}", style(&compact_tool_error(detail), DIM));
+}
+
+fn compact_tool_error(detail: &str) -> String {
+    const MAX_CHARS: usize = 240;
+    let normalized = detail
+        .strip_prefix("ERROR:")
+        .unwrap_or(detail)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut chars = normalized.chars();
+    let shortened = chars.by_ref().take(MAX_CHARS).collect::<String>();
+    if chars.next().is_some() {
+        format!("{shortened}…")
+    } else {
+        shortened
+    }
 }
 
 /// The header line printed above Finn's answer, e.g. `● Finn`.
@@ -629,6 +653,26 @@ mod tests {
             ..Usage::default()
         };
         assert_eq!(format_usage(usage), "1,200 in + 300 out = 1,500");
+    }
+
+    #[test]
+    fn compacts_tool_errors_for_terminal_display() {
+        assert_eq!(
+            compact_tool_error("ERROR: MAIL_TIMEOUT:\n Apple Mail stalled"),
+            "MAIL_TIMEOUT: Apple Mail stalled"
+        );
+        assert!(compact_tool_error(&"x".repeat(300)).ends_with('…'));
+    }
+
+    #[test]
+    fn readline_prompt_is_plain_and_highlighting_preserves_visible_text() {
+        let prompt = prompt("finn");
+        assert_eq!(prompt, "finn › ");
+        assert!(!prompt.chars().any(char::is_control));
+        assert!(!prompt.contains('\x1b'));
+
+        let highlighted = highlight_prompt(&prompt);
+        assert!(highlighted.contains(&prompt));
     }
 
     #[test]

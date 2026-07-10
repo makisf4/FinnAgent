@@ -17,7 +17,7 @@ Finn does not hand generated commands back to the user. An imperative task is au
 - Search for and download public HTTPS images or files to an exact local path
 - Optionally run explicitly requested Bash/Zsh commands in a secret-free subprocess
 - Search and read Apple Mail messages in Inbox, Trash, Junk, Sent, and Drafts
-- List and save attachments from those Apple Mail messages
+- Find recent attachments by file type without scanning the whole mailbox, then list and save them
 - Send email with file attachments through Apple Mail when explicitly requested
 - Preserve conversation context during the running session
 - Optionally record completed task summaries locally

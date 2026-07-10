@@ -489,6 +489,15 @@ impl ToolContext {
                 )
                 .await
             }
+            "mail_recent_attachments" => {
+                mail::recent_attachments(
+                    required_str(&args, "query")?,
+                    required_str(&args, "extension")?,
+                    required_str(&args, "mailbox")?,
+                    required_u64(&args, "limit")? as usize,
+                )
+                .await
+            }
             "mail_read" => {
                 mail::read(
                     required_u64(&args, "message_id")?,
@@ -665,6 +674,7 @@ mod tests {
             .filter_map(|tool| tool["name"].as_str())
             .collect::<Vec<_>>();
         assert!(mail_names.contains(&"mail_search"));
+        assert!(mail_names.contains(&"mail_recent_attachments"));
         assert!(mail_names.contains(&"mail_read"));
         assert!(!mail_names.contains(&"mail_send"));
         assert!(!mail_names.contains(&"write_file"));

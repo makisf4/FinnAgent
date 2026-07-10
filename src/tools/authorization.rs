@@ -168,7 +168,11 @@ impl TaskAuthorization {
                     "mail_save_attachment denied: the user did not explicitly ask to save, copy, download, move, or extract an attachment"
                 )
             }
-            "mail_search" | "mail_read" | "mail_list_attachments" if self.allow_mail_read => Ok(()),
+            "mail_search" | "mail_recent_attachments" | "mail_read" | "mail_list_attachments"
+                if self.allow_mail_read =>
+            {
+                Ok(())
+            }
             "codex_start" | "codex_resume" if self.allow_codex => Ok(()),
             "path_status" | "list_directory" | "find_files" | "find_large_files"
                 if self.allow_file_read =>

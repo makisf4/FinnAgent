@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use rustyline::completion::{Completer, Pair};
 use rustyline::highlight::Highlighter;
 use rustyline::hint::Hinter;
@@ -29,7 +31,15 @@ impl Hinter for SlashHelper {
     type Hint = String;
 }
 
-impl Highlighter for SlashHelper {}
+impl Highlighter for SlashHelper {
+    fn highlight_prompt<'b, 's: 'b, 'p: 'b>(
+        &'s self,
+        prompt: &'p str,
+        _default: bool,
+    ) -> Cow<'b, str> {
+        Cow::Owned(ui::highlight_prompt(prompt))
+    }
+}
 
 impl Validator for SlashHelper {
     fn validate(&self, context: &mut ValidationContext<'_>) -> rustyline::Result<ValidationResult> {

@@ -43,7 +43,7 @@ Execution policy:
 - When the user asks to mail or email a report or file, include that file in mail_send attachments. Do not merely send its path as text.
 - A successful mail_send result means Apple Mail accepted the message for sending. Report that exact state; never claim recipient delivery.
 - Prefer dedicated filesystem and Mail tools over shell commands.
-- To copy a received email attachment, use mail_search, mail_list_attachments, and mail_save_attachment. Search the relevant mailbox scopes, including Trash when appropriate, and pass the same mailbox to subsequent Mail calls. Never search or modify Apple Mail's private storage directories directly.
+- For latest/recent email attachments or a requested file type, use mail_recent_attachments; use mail_search for sender/subject searches. Prefer rows where query_match is true, then classify bounded fallback candidates from their sender, subject, and attachment name. Pass the returned message ID, attachment index, and mailbox directly to mail_save_attachment. Use mail_list_attachments only when the attachment index is not already known. Search relevant mailbox scopes, including Trash when appropriate. Never search or modify Apple Mail's private storage directories directly.
 - Use artifact_read for DOCX, PDF, XLSX, TXT, and image inspection instead of read_file or shell utilities.
 - Use document_create and document_replace_text for TXT/DOCX work, spreadsheet_update for XLSX cells and formulas, the PDF tools for PDF text/pages, and image_transform for raster images.
 - After creating or changing an artifact, verify it with artifact_read or path_status before reporting success. Explain tool limitations precisely when a requested edit cannot preserve the source layout.
@@ -508,6 +508,9 @@ impl Agent {
                     };
                     spinner.pause_line().await;
                     ui::render_tool_call(tool_calls, &call.name, status);
+                    if status != "complete" {
+                        ui::render_tool_error(&result);
+                    }
                     if pauses_for_confirmation {
                         spinner.resume();
                     }
@@ -528,6 +531,12 @@ impl Agent {
                         &call.id,
                         &crate::tools::model_tool_result(&call.name, &result),
                     );
+                    if is_mail_timeout(&call.name, status, &result) {
+                        bail!(
+                            "Apple Mail timed out while running {}. Finn stopped instead of retrying the same slow mailbox operation.",
+                            call.name
+                        );
+                    }
                     // Distinct-argument retries evade the identical-call cap,
                     // so a separate consecutive-failure cap stops a model that
                     // thrashes one tool with a stream of new bad inputs.
@@ -695,11 +704,16 @@ fn activates_untrusted_context(tool_name: &str, result: &str) -> bool {
             | "read_file"
             | "artifact_read"
             | "mail_search"
+            | "mail_recent_attachments"
             | "mail_read"
             | "mail_list_attachments"
             | "codex_start"
             | "codex_resume"
     ) && !result.starts_with("ERROR:")
+}
+
+fn is_mail_timeout(tool_name: &str, status: &str, result: &str) -> bool {
+    status == "error" && tool_name.starts_with("mail_") && result.contains("MAIL_TIMEOUT:")
 }
 
 fn tool_may_request_confirmation(tool_name: &str, arguments: &str) -> bool {
@@ -732,6 +746,10 @@ mod tests {
             "id\tsender\tsubject"
         ));
         assert!(activates_untrusted_context(
+            "mail_recent_attachments",
+            "message_id\tattachment_index\tattachment_name"
+        ));
+        assert!(activates_untrusted_context(
             "mail_read",
             "from: attacker@example.com"
         ));
@@ -750,6 +768,25 @@ mod tests {
         assert!(!activates_untrusted_context(
             "mail_save_attachment",
             "status: complete"
+        ));
+    }
+
+    #[test]
+    fn recognizes_only_structured_mail_timeouts() {
+        assert!(is_mail_timeout(
+            "mail_search",
+            "error",
+            "ERROR: MAIL_TIMEOUT: Apple Mail did not respond"
+        ));
+        assert!(!is_mail_timeout(
+            "mail_search",
+            "error",
+            "ERROR: Apple Mail operation failed"
+        ));
+        assert!(!is_mail_timeout(
+            "read_file",
+            "error",
+            "ERROR: MAIL_TIMEOUT: unrelated"
         ));
     }
 
