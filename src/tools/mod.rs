@@ -10,7 +10,7 @@ mod web;
 
 use std::collections::HashSet;
 use std::env;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -27,13 +27,13 @@ pub struct ToolContext {
     data_dir: PathBuf,
     confirmer: Confirmer,
     codex_sessions: codex::SessionStore,
-    /// Canonical paths of files and directories created by tools during the
-    /// current task. Task-scoped provenance: reading back an output the task
-    /// itself produced reveals nothing the model did not already have, so
-    /// these paths stay readable and writable under untrusted-context
-    /// restrictions. Cleared by `begin_task` so bindings never outlive the
-    /// task that earned them.
-    task_created_paths: Arc<Mutex<HashSet<PathBuf>>>,
+    /// Filesystem identities (device, inode) of files and directories created
+    /// by tools during the current task. Task-scoped provenance: reading back
+    /// an output the task itself produced reveals nothing the model did not
+    /// already have, so these files stay readable and writable under
+    /// untrusted-context restrictions. Cleared by `begin_task` so bindings
+    /// never outlive the task that earned them.
+    task_created_files: Arc<Mutex<HashSet<(u64, u64)>>>,
 }
 
 /// Returns only capabilities authorized by the current user request.
@@ -108,7 +108,7 @@ impl ToolContext {
             data_dir,
             confirmer,
             codex_sessions: codex::SessionStore::default(),
-            task_created_paths: Arc::new(Mutex::new(HashSet::new())),
+            task_created_files: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -116,29 +116,31 @@ impl ToolContext {
     /// user task so provenance bindings from one task cannot authorize reads
     /// in a later one.
     pub fn begin_task(&self) {
-        self.task_created_paths
+        self.task_created_files
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clear();
     }
-
-    /// Records a path that a tool successfully created during this task.
-    /// Canonicalized so later checks are not fooled by an alternate spelling
-    /// of the same location.
+    /// Records a file a tool successfully created during this task, keyed by
+    /// filesystem identity (device, inode) rather than path text: macOS user
+    /// volumes are case-insensitive, so two differently spelled paths can name
+    /// the same file and string comparison would wrongly deny it.
     fn note_created(&self, path: &Path) {
-        let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-        self.task_created_paths
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(canonical);
+        if let Some(identity) = file_identity(path) {
+            self.task_created_files
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(identity);
+        }
     }
 
     fn created_by_task(&self, path: &Path) -> bool {
-        let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-        self.task_created_paths
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .contains(&canonical)
+        file_identity(path).is_some_and(|identity| {
+            self.task_created_files
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .contains(&identity)
+        })
     }
 
     /// Read authorization with task provenance: outputs this task created are
@@ -585,6 +587,15 @@ impl ToolContext {
     }
 }
 
+/// Filesystem identity of an existing path: (device, inode). Follows symlinks,
+/// so provenance matches the actual file a tool produced regardless of how a
+/// later call spells its path.
+fn file_identity(path: &Path) -> Option<(u64, u64)> {
+    std::fs::metadata(path)
+        .ok()
+        .map(|metadata| (metadata.dev(), metadata.ino()))
+}
+
 fn required_str<'a>(args: &'a Value, name: &str) -> Result<&'a str> {
     args.get(name)
         .and_then(Value::as_str)
@@ -1029,6 +1040,17 @@ mod tests {
             .await;
         assert!(!allowed.starts_with("ERROR"), "{allowed}");
         assert!(output.exists());
+
+        // Provenance is keyed by filesystem identity, so a differently spelled
+        // path to the same file (macOS user volumes are case-insensitive) must
+        // still match. Skip silently on case-sensitive filesystems.
+        let respelled = desktop.join("PHOTO-1234.PNG");
+        if file_identity(&respelled) == file_identity(&input) {
+            assert!(
+                context.created_by_task(&respelled),
+                "identity-keyed provenance must match an alternate spelling"
+            );
+        }
 
         // A new task clears provenance: the same call is denied again.
         context.begin_task();
