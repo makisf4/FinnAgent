@@ -669,7 +669,7 @@ fn sanitize_value(value: &Value) -> Value {
     match value {
         Value::String(text) => sanitize_string(text),
         Value::Array(values) => Value::Array(values.iter().map(sanitize_value).collect()),
-        Value::Object(object) if is_image_object(value) => {
+        Value::Object(_) if is_image_object(value) => {
             json!({"type": "text", "text": VISUAL_SANITIZED})
         }
         Value::Object(object) => Value::Object(
