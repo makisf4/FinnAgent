@@ -132,18 +132,20 @@ pub async fn list_directory(path: &Path, limit: usize) -> Result<String> {
     while let Some(entry) = reader.next_entry().await? {
         let metadata = entry.metadata().await?;
         let kind = if metadata.is_dir() { "dir" } else { "file" };
-        entries.push(format!(
-            "{kind}\t{}\t{}",
-            metadata.len(),
-            entry.path().display()
-        ));
+        entries.push((kind, entry.path(), metadata.len()));
     }
+    // Directories first, then files, each alphabetical by path. Sorting on the
+    // tuple keeps sizes numeric instead of comparing them as strings.
     entries.sort();
     entries.truncate(limit);
     Ok(if entries.is_empty() {
         "directory is empty".to_owned()
     } else {
-        entries.join("\n")
+        entries
+            .iter()
+            .map(|(kind, path, size)| format!("{kind}\t{size}\t{}", path.display()))
+            .collect::<Vec<_>>()
+            .join("\n")
     })
 }
 
@@ -311,15 +313,21 @@ pub async fn move_to_trash(path: &Path, trash: &Path) -> Result<String> {
         suffix += 1;
     }
 
-    tokio::fs::rename(path, &destination)
-        .await
-        .with_context(|| {
+    if let Err(error) = tokio::fs::rename(path, &destination).await {
+        if error.kind() == std::io::ErrorKind::CrossesDevices {
+            bail!(
+                "cannot move {} to Trash: it is on a different volume than the user's Trash folder. Finn does not copy across volumes for deletion; the user can remove it manually in Finder.",
+                path.display()
+            );
+        }
+        return Err(error).with_context(|| {
             format!(
                 "cannot move {} to {}",
                 path.display(),
                 destination.display()
             )
-        })?;
+        });
+    }
     let kind = if metadata.is_dir() {
         "directory"
     } else {
@@ -373,6 +381,31 @@ mod tests {
         // With overwrite the write proceeds.
         write_file(&file, "second", true).await.unwrap();
         assert_eq!(read_file(&file, 100).await.unwrap(), "second");
+    }
+
+    #[tokio::test]
+    async fn lists_directories_before_files_with_numeric_sizes() {
+        let temp = tempfile::tempdir().unwrap();
+        tokio::fs::create_dir(temp.path().join("zeta-dir"))
+            .await
+            .unwrap();
+        tokio::fs::write(temp.path().join("alpha.txt"), vec![0_u8; 1000])
+            .await
+            .unwrap();
+        tokio::fs::write(temp.path().join("beta.txt"), vec![0_u8; 9])
+            .await
+            .unwrap();
+
+        let listing = list_directory(temp.path(), 10).await.unwrap();
+        let lines: Vec<&str> = listing.lines().collect();
+        // Directories sort before files regardless of name, and files sort by
+        // path, not by their sizes compared as strings ("1000" vs "9").
+        assert!(lines[0].starts_with("dir\t") && lines[0].ends_with("zeta-dir"));
+        assert!(lines[1].starts_with("file\t1000\t") && lines[1].ends_with("alpha.txt"));
+        assert!(lines[2].starts_with("file\t9\t") && lines[2].ends_with("beta.txt"));
+
+        let truncated = list_directory(temp.path(), 1).await.unwrap();
+        assert_eq!(truncated.lines().count(), 1);
     }
 
     #[tokio::test]
