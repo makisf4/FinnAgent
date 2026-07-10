@@ -34,6 +34,10 @@ pub struct ToolContext {
     /// untrusted-context restrictions. Cleared by `begin_task` so bindings
     /// never outlive the task that earned them.
     task_created_files: Arc<Mutex<HashSet<(u64, u64)>>>,
+    /// Number of emails Apple Mail accepted during the current user task.
+    /// A task authorizes one intended outbound message, not model-generated
+    /// probes or follow-up test messages.
+    mail_sends_accepted: Arc<Mutex<u8>>,
 }
 
 /// Returns only capabilities authorized by the current user request.
@@ -109,6 +113,7 @@ impl ToolContext {
             confirmer,
             codex_sessions: codex::SessionStore::default(),
             task_created_files: Arc::new(Mutex::new(HashSet::new())),
+            mail_sends_accepted: Arc::new(Mutex::new(0)),
         }
     }
 
@@ -120,6 +125,31 @@ impl ToolContext {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clear();
+        *self
+            .mail_sends_accepted
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = 0;
+    }
+
+    fn require_mail_send_available(&self, subject: &str) -> Result<()> {
+        validate_mail_subject(subject)?;
+        if *self
+            .mail_sends_accepted
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            > 0
+        {
+            bail!("mail_send denied: Finn may send at most one email per user task");
+        }
+        Ok(())
+    }
+
+    fn note_mail_send_accepted(&self) {
+        let mut count = self
+            .mail_sends_accepted
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        *count = count.saturating_add(1);
     }
     /// Records a file a tool successfully created during this task, keyed by
     /// filesystem identity (device, inode) rather than path text: macOS user
@@ -546,6 +576,7 @@ impl ToolContext {
                     filesystem::ensure_not_sensitive(attachment, &self.home)?;
                 }
                 let subject = required_str(&args, "subject")?;
+                self.require_mail_send_available(subject)?;
                 self.confirm_or_deny(
                     "mail_send",
                     &format!(
@@ -554,7 +585,10 @@ impl ToolContext {
                     ),
                 )
                 .await?;
-                mail::send(to, subject, required_str(&args, "body")?, &attachments).await
+                let result =
+                    mail::send(to, subject, required_str(&args, "body")?, &attachments).await?;
+                self.note_mail_send_accepted();
+                Ok(result)
             }
             _ => bail!("unknown tool: {name}"),
         }?;
@@ -659,6 +693,21 @@ fn required_string_array<'a>(args: &'a Value, name: &str) -> Result<Vec<&'a str>
         .collect()
 }
 
+fn validate_mail_subject(subject: &str) -> Result<()> {
+    let normalized = subject.trim().to_lowercase();
+    let placeholder = matches!(
+        normalized.as_str(),
+        "" | "." | "-" | "test" | "testing" | "δοκιμη" | "δοκιμή"
+    ) || ((normalized.contains("test") || normalized.contains("δοκιμ"))
+        && (normalized.contains("ignore")
+            || normalized.contains("αγνο")
+            || normalized.contains("αγνό")));
+    if placeholder {
+        bail!("mail_send denied: placeholder or test email subjects are not allowed");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -757,6 +806,31 @@ mod tests {
                 .as_str()
                 .is_some_and(|kind| kind.starts_with("openrouter:"))
         }));
+    }
+
+    #[test]
+    fn rejects_placeholder_and_repeated_mail_sends_per_task() {
+        let context = ToolContext::new(
+            PathBuf::from("/Users/tester"),
+            PathBuf::from("/Users/tester/data"),
+            Confirmer::AutoDeny,
+        );
+        for subject in ["", ".", "test", "δοκιμή", "Αγνόηση test emails"] {
+            assert!(context.require_mail_send_available(subject).is_err());
+        }
+        assert!(
+            context
+                .require_mail_send_available("Σύνοψη τιμολογίων MASKA 2026")
+                .is_ok()
+        );
+        context.note_mail_send_accepted();
+        assert!(
+            context
+                .require_mail_send_available("Δεύτερο μήνυμα")
+                .is_err()
+        );
+        context.begin_task();
+        assert!(context.require_mail_send_available("Νέα εργασία").is_ok());
     }
 
     #[test]

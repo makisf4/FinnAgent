@@ -236,6 +236,11 @@ impl TaskAuthorization {
 
     pub(super) fn require_outbound_attachments(self, attachments: &[PathBuf]) -> Result<()> {
         if attachments.is_empty() {
+            if self.authorized_attachment_count > 0 {
+                bail!(
+                    "mail_send attachment denied: the user named a file to send, but the email has no attachment"
+                );
+            }
             return Ok(());
         }
         let authorized =
@@ -357,6 +362,8 @@ impl ParsedIntent {
         let text = TaskText::new(task);
         let raw = text.raw();
 
+        let invoice_reference = text.has_phrase(&["invoice", "invoices", "receipt", "receipts"])
+            || text.has_stem(&["τιμολογ", "παραστατ", "αποδειξ"]);
         let mail_object = text
             .has_phrase(&["email", "emails", "mail", "mails", "message", "messages"])
             || text.has_stem(&["μήνυμ", "μηνυμ"]);
@@ -405,6 +412,7 @@ impl ParsedIntent {
         ]) || text.has_stem(&[
             "αποθήκευσ",
             "αποθηκευσ",
+            "σωσ",
             "αντιγρα",
             "κατέβασ",
             "κατεβασ",
@@ -462,21 +470,25 @@ impl ParsedIntent {
         let delete_negated = delete_negated
             || (delete_action && text.has_phrase(&["do not", "don't", "dont", "never", "without"]));
         let artifact_suboperation = artifact_page_or_image_suboperation(&text);
-        let filesystem_target = text.has_phrase(&[
-            "file",
-            "files",
-            "folder",
-            "folders",
-            "directory",
-            "directories",
-            "path",
-            "desktop",
-            "documents",
-            "downloads",
-        ]) || text.has_stem(&["αρχεί", "αρχει", "φάκελ", "φακελ"])
-            || text.contains_fragment("~/")
-            || text.contains_fragment("/users/")
-            || text.has_file_extension();
+        let directory_reference =
+            text.has_phrase(&["folder", "folders", "directory", "directories"])
+                || text.has_stem(&["φάκελ", "φακελ", "κατάλογ", "καταλογ"]);
+        let filesystem_target =
+            text.has_phrase(&[
+                "file",
+                "files",
+                "folder",
+                "folders",
+                "directory",
+                "directories",
+                "path",
+                "desktop",
+                "documents",
+                "downloads",
+            ]) || text.has_stem(&["αρχεί", "αρχει", "φάκελ", "φακελ", "κατάλογ", "καταλογ"])
+                || text.contains_fragment("~/")
+                || text.contains_fragment("/users/")
+                || text.has_file_extension();
         let codex_object = text.has_phrase(&["codex", "codex cli", "code cli"]);
         let codex_action = text.has_phrase(&[
             "use codex",
@@ -518,7 +530,7 @@ impl ParsedIntent {
             "todays news",
         ]);
         let write_verb = text.has_phrase(&["write", "create", "save", "make"])
-            || text.has_stem(&["γραψ", "δημιουργησ", "φτιαξ", "βαλ"]);
+            || text.has_stem(&["γραψ", "δημιουργησ", "φτιαξ", "βαλ", "σωσ", "αποθηκευσ"]);
         let file_noun = text.has_phrase(&[
             "file",
             "files",
@@ -531,13 +543,14 @@ impl ParsedIntent {
             "script",
             "scripts",
             "txt",
-        ]) || text.has_stem(&["αρχε"])
+        ]) || text.has_stem(&["αρχε", "συνοψ"])
             || text.has_file_extension();
         let file_write = write_verb && file_noun;
         let directory_create = ((text.has_phrase(&["create", "make"]))
             && text.has_phrase(&["folder", "directory"]))
             || (text.has_stem(&["δημιούργησ", "δημιουργησ", "φτιάξ", "φτιαξ"])
-                && text.has_stem(&["φάκελ", "φακελ"]));
+                && text.has_stem(&["φάκελ", "φακελ", "κατάλογ", "καταλογ"]))
+            || (transfer_action && directory_reference);
         let artifact_reference =
             text.has_phrase(&[
                 "docx",
@@ -584,7 +597,8 @@ impl ParsedIntent {
                 "αντικαταστ",
                 "περιστρ",
                 "μετατροπ",
-            ]);
+            ])
+            || (write_verb && artifact_reference);
         let conversational_mail_action = text.has_phrase(&["forward", "reply"])
             || text.has_stem(&["προώθησ", "προωθησ", "απάντησ", "απαντησ"]);
         let content_read_action = text.has_phrase(&[
@@ -652,7 +666,7 @@ impl ParsedIntent {
             "επεξεργαστ",
         ]);
 
-        let (recipient_hashes, recipient_count) = extract_recipient_hashes(raw);
+        let (recipient_hashes, recipient_count) = extract_recipient_hashes(raw, send_action);
         let (attachment_hashes, attachment_count) = extract_attachment_hashes(raw);
         let (target_hashes, target_count) = extract_target_hashes(raw);
         Self {
@@ -665,7 +679,9 @@ impl ParsedIntent {
                     || (delete_action && !artifact_suboperation && filesystem_target))
                     && !delete_negated,
                 mail_attachment_save: transfer_action
-                    && (attachment_reference || (mail_object && deictic_reference)),
+                    && (attachment_reference
+                        || invoice_reference
+                        || (mail_object && deictic_reference)),
                 codex: codex_object && codex_action,
                 web: (web_reference && web_action)
                     || web_download
@@ -677,9 +693,11 @@ impl ParsedIntent {
                 overwrite,
                 file_read: filesystem_target || artifact_reference,
                 file_content_read: ((filesystem_target || artifact_reference)
-                    && content_read_action)
+                    && (content_read_action || (artifact_reference && read_action)))
                     || artifact_write,
-                mail_read: (mail_object || attachment_reference)
+                mail_read: (mail_object
+                    || attachment_reference
+                    || (invoice_reference && raw.contains('@')))
                     && (read_action || transfer_action),
                 system_info,
             },
@@ -832,10 +850,30 @@ fn normalize_for_matching(task: &str) -> String {
         .collect()
 }
 
-fn extract_recipient_hashes(task: &str) -> ([u64; 4], u8) {
+fn extract_recipient_hashes(task: &str, send_action: bool) -> ([u64; 4], u8) {
     let mut hashes = [0_u64; 4];
+    if !send_action {
+        return (hashes, 0);
+    }
+    let normalized = normalize_for_matching(task);
+    let recipient_start = [
+        "send",
+        "forward",
+        "reply",
+        "email ",
+        "mail ",
+        "στειλ",
+        "προωθησ",
+        "απαντησ",
+        "αποστολ",
+    ]
+    .iter()
+    .filter_map(|marker| normalized.rfind(marker))
+    .max()
+    .unwrap_or(0);
+    let recipient_scope = &normalized[recipient_start..];
     let mut count = 0_usize;
-    for token in task.split(|character: char| {
+    for token in recipient_scope.split(|character: char| {
         !(character.is_ascii_alphanumeric() || matches!(character, '@' | '.' | '_' | '+' | '-'))
     }) {
         let token = token
@@ -1266,6 +1304,41 @@ mod tests {
     }
 
     #[test]
+    fn authorizes_greek_invoice_mail_workflow_and_binds_only_outbound_recipient() {
+        let task = "βρες τα τιμολογια που έχουν έρθει από το nsimeonakis@gmail.com από 01/01/2026 και σωσε τα στον καταλογο Invo_2026 στο Desktop. Επειτα βρες ποια από αυτά τα τιμολόγια είναι από την εταιρία MASKA ή ΜΑΣΚΑ και σωσε τα σε νέο καταλογο /Desktop/Invo_2026/Maska, επειτα από αυτά τα τιμολόγια βρες α)το συνολικό ποσό, β)το ποσό του ΦΠΑ και σώσε τα σε μια σύνοψη στο αρχείο synopsi.xlsx μέσα στον φάκελο /Desktop/Invo_2026/Maska, και στειλέ το synopsi.xlsx στο makisf4@gmail.com";
+        let intent = ParsedIntent::parse(task);
+        assert!(intent.capabilities.mail_read);
+        assert!(intent.capabilities.mail_attachment_save);
+        assert!(intent.capabilities.directory_create);
+        assert!(intent.capabilities.file_content_read);
+        assert!(intent.capabilities.artifact_write);
+        assert!(intent.capabilities.mail_send);
+        assert_eq!(intent.bindings.recipient_count, 1);
+
+        let authorization = TaskAuthorization::from_task(task);
+        assert!(
+            authorization
+                .require_mail_recipient("makisf4@gmail.com")
+                .is_ok()
+        );
+        assert!(
+            authorization
+                .require_mail_recipient("nsimeonakis@gmail.com")
+                .is_err()
+        );
+        for tool in [
+            "mail_recent_attachments",
+            "mail_save_attachment",
+            "create_directory",
+            "artifact_read",
+            "spreadsheet_update",
+            "mail_send",
+        ] {
+            assert!(authorization.require_tool(tool).is_ok(), "missing {tool}");
+        }
+    }
+
+    #[test]
     fn derives_high_impact_authorization_from_original_task() {
         let mail = TaskAuthorization::from_task("Send the report to alex@example.com");
         assert!(mail.require_mail_send().is_ok());
@@ -1430,6 +1503,7 @@ mod tests {
                 .require_outbound_attachments(&[PathBuf::from("/tmp/report.pdf")])
                 .is_ok()
         );
+        assert!(with_file.require_outbound_attachments(&[]).is_err());
         assert!(
             with_file
                 .require_outbound_attachments(&[PathBuf::from("/tmp/other.pdf")])

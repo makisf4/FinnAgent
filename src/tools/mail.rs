@@ -210,13 +210,11 @@ on run argv
         else
             set sourceMailbox to drafts mailbox
         end if
-        repeat with messageItem in messages of sourceMailbox
-            if (id of messageItem) is targetId then
-                return "from: " & (sender of messageItem) & linefeed & "subject: " & (subject of messageItem) & linefeed & "date: " & ((date received of messageItem) as text) & linefeed & linefeed & (content of messageItem)
-            end if
-        end repeat
+        set matchingMessages to (every message of sourceMailbox whose id is targetId)
+        if (count of matchingMessages) is 0 then return "message not found"
+        set messageItem to item 1 of matchingMessages
+        return "from: " & (sender of messageItem) & linefeed & "subject: " & (subject of messageItem) & linefeed & "date: " & ((date received of messageItem) as text) & linefeed & linefeed & (content of messageItem)
     end tell
-    return "message not found"
 end run
 "#;
     run_osascript(script, &[&message_id.to_string(), mailbox_scope]).await
@@ -240,20 +238,18 @@ on run argv
         else
             set sourceMailbox to drafts mailbox
         end if
-        repeat with messageItem in messages of sourceMailbox
-            if (id of messageItem) is targetId then
-                set attachmentItems to mail attachments of messageItem
-                if (count of attachmentItems) is 0 then return "no attachments"
-                set outputLines to {}
-                repeat with attachmentIndex from 1 to count of attachmentItems
-                    set attachmentItem to item attachmentIndex of attachmentItems
-                    set end of outputLines to (attachmentIndex as text) & tab & (name of attachmentItem) & tab & ((file size of attachmentItem) as text) & tab & ((downloaded of attachmentItem) as text)
-                end repeat
-                return joinLines(outputLines)
-            end if
+        set matchingMessages to (every message of sourceMailbox whose id is targetId)
+        if (count of matchingMessages) is 0 then return "message not found"
+        set messageItem to item 1 of matchingMessages
+        set attachmentItems to mail attachments of messageItem
+        if (count of attachmentItems) is 0 then return "no attachments"
+        set outputLines to {}
+        repeat with attachmentIndex from 1 to count of attachmentItems
+            set attachmentItem to item attachmentIndex of attachmentItems
+            set end of outputLines to (attachmentIndex as text) & tab & (name of attachmentItem) & tab & ((file size of attachmentItem) as text) & tab & ((downloaded of attachmentItem) as text)
         end repeat
+        return my joinLines(outputLines)
     end tell
-    return "message not found"
 end run
 
 on joinLines(itemsList)
@@ -305,17 +301,15 @@ on run argv
         else
             set sourceMailbox to drafts mailbox
         end if
-        repeat with messageItem in messages of sourceMailbox
-            if (id of messageItem) is targetId then
-                set attachmentItems to mail attachments of messageItem
-                if attachmentIndex is greater than (count of attachmentItems) then error "Attachment index is out of range."
-                set attachmentItem to item attachmentIndex of attachmentItems
-                save attachmentItem in (POSIX file destinationPath)
-                return name of attachmentItem
-            end if
-        end repeat
+        set matchingMessages to (every message of sourceMailbox whose id is targetId)
+        if (count of matchingMessages) is 0 then error "Message not found in the selected mailbox."
+        set messageItem to item 1 of matchingMessages
+        set attachmentItems to mail attachments of messageItem
+        if attachmentIndex is greater than (count of attachmentItems) then error "Attachment index is out of range."
+        set attachmentItem to item attachmentIndex of attachmentItems
+        save attachmentItem in (POSIX file destinationPath)
+        return name of attachmentItem
     end tell
-    error "Message not found in the selected mailbox."
 end run
 "#;
     let attachment_index = attachment_index.to_string();
@@ -680,5 +674,26 @@ mod tests {
             .await
             .unwrap();
         assert!(result.contains("query_match\tmessage_id\tsender\tsubject\tdate"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a configured Apple Mail account and Automation permission"]
+    async fn reads_and_lists_a_recent_live_message_by_id() {
+        let recent = recent_attachments("", "pdf", "inbox", 1).await.unwrap();
+        let row = recent
+            .lines()
+            .find(|line| line.starts_with("true\t") || line.starts_with("false\t"))
+            .expect("expected a recent PDF attachment row");
+        let message_id = row
+            .split('\t')
+            .nth(1)
+            .expect("expected message ID")
+            .parse::<u64>()
+            .expect("message ID should be numeric");
+
+        let message = read(message_id, "inbox").await.unwrap();
+        assert!(message.starts_with("from: "));
+        let attachments = list_attachments(message_id, "inbox").await.unwrap();
+        assert!(attachments.starts_with("index\tname\tsize_bytes\tdownloaded"));
     }
 }

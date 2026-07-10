@@ -43,7 +43,8 @@ Execution policy:
 - When the user asks to mail or email a report or file, include that file in mail_send attachments. Do not merely send its path as text.
 - A successful mail_send result means Apple Mail accepted the message for sending. Report that exact state; never claim recipient delivery.
 - Prefer dedicated filesystem and Mail tools over shell commands.
-- For latest/recent email attachments or a requested file type, use mail_recent_attachments; use mail_search for sender/subject searches. Prefer rows where query_match is true, then classify bounded fallback candidates from their sender, subject, and attachment name. Pass the returned message ID, attachment index, and mailbox directly to mail_save_attachment. Use mail_list_attachments only when the attachment index is not already known. Search relevant mailbox scopes, including Trash when appropriate. Never search or modify Apple Mail's private storage directories directly.
+- For latest/recent email attachments or a requested file type, use mail_recent_attachments; use mail_search for sender/subject searches. Prefer rows where query_match is true, then classify bounded fallback candidates from their sender, subject, and attachment name. Pass the returned message ID, attachment index, and mailbox directly to mail_save_attachment. After mail_recent_attachments succeeds, never call mail_list_attachments: its indexes are already authoritative. Search relevant mailbox scopes, including Trash when appropriate. Never search or modify Apple Mail's private storage directories directly.
+- Never send test, probe, placeholder, empty-subject, or cleanup emails. A user task authorizes at most one intended outbound email. If the user named a file to send, create and verify that file first, then attach it; never call mail_send with an empty attachments array for that task.
 - Use artifact_read for DOCX, PDF, XLSX, TXT, and image inspection instead of read_file or shell utilities.
 - Use document_create and document_replace_text for TXT/DOCX work, spreadsheet_update for XLSX cells and formulas, the PDF tools for PDF text/pages, and image_transform for raster images.
 - After creating or changing an artifact, verify it with artifact_read or path_status before reporting success. Explain tool limitations precisely when a requested edit cannot preserve the source layout.
@@ -347,6 +348,7 @@ impl Agent {
         let mut call_budget = CALLS_PER_BATCH;
         let mut round_index = 0_usize;
         let mut web_phase_complete = false;
+        let mut recent_attachment_indexes_available = false;
 
         loop {
             if round_index >= round_budget {
@@ -368,8 +370,12 @@ impl Agent {
                 }
             }
             spinner.set_label("Thinking").await;
-            let available_tools =
+            let mut available_tools =
                 crate::tools::definitions_for_turn(authorization, !web_phase_complete);
+            hide_redundant_mail_list_tool(
+                &mut available_tools,
+                recent_attachment_indexes_available,
+            );
             let has_server_web = available_tools.iter().any(|tool| {
                 tool.get("type")
                     .and_then(Value::as_str)
@@ -483,10 +489,15 @@ impl Agent {
                     if pauses_for_confirmation {
                         spinner.pause_for_prompt().await;
                     }
-                    let result = self
-                        .tools
-                        .execute(&call.name, &call.arguments, authorization)
-                        .await;
+                    let redundant_mail_list =
+                        is_redundant_mail_list(&call.name, recent_attachment_indexes_available);
+                    let result = if redundant_mail_list {
+                        "ERROR: mail_list_attachments denied: mail_recent_attachments already returned the 1-based attachment indexes; use those indexes directly with mail_save_attachment".to_owned()
+                    } else {
+                        self.tools
+                            .execute(&call.name, &call.arguments, authorization)
+                            .await
+                    };
                     if activates_untrusted_context(&call.name, &result) {
                         authorization.mark_untrusted();
                         if !self.untrusted_external_context {
@@ -506,6 +517,9 @@ impl Agent {
                     } else {
                         "complete"
                     };
+                    if status == "complete" && call.name == "mail_recent_attachments" {
+                        recent_attachment_indexes_available = true;
+                    }
                     spinner.pause_line().await;
                     ui::render_tool_call(tool_calls, &call.name, status);
                     if status != "complete" {
@@ -531,6 +545,9 @@ impl Agent {
                         &call.id,
                         &crate::tools::model_tool_result(&call.name, &result),
                     );
+                    if redundant_mail_list {
+                        continue;
+                    }
                     if is_mail_timeout(&call.name, status, &result) {
                         bail!(
                             "Apple Mail timed out while running {}. Finn stopped instead of retrying the same slow mailbox operation.",
@@ -716,6 +733,18 @@ fn is_mail_timeout(tool_name: &str, status: &str, result: &str) -> bool {
     status == "error" && tool_name.starts_with("mail_") && result.contains("MAIL_TIMEOUT:")
 }
 
+fn is_redundant_mail_list(tool_name: &str, recent_indexes_available: bool) -> bool {
+    recent_indexes_available && tool_name == "mail_list_attachments"
+}
+
+fn hide_redundant_mail_list_tool(tools: &mut Vec<Value>, recent_indexes_available: bool) {
+    if recent_indexes_available {
+        tools.retain(|tool| {
+            tool.get("name").and_then(Value::as_str) != Some("mail_list_attachments")
+        });
+    }
+}
+
 fn tool_may_request_confirmation(tool_name: &str, arguments: &str) -> bool {
     if matches!(tool_name, "mail_send" | "move_to_trash") {
         return true;
@@ -788,6 +817,25 @@ mod tests {
             "error",
             "ERROR: MAIL_TIMEOUT: unrelated"
         ));
+    }
+
+    #[test]
+    fn removes_redundant_attachment_listing_after_recent_discovery() {
+        let authorization = TaskAuthorization::from_task("Find and save email attachments");
+        let mut tools = crate::tools::definitions_for(authorization);
+        assert!(
+            tools
+                .iter()
+                .any(|tool| tool["name"] == "mail_list_attachments")
+        );
+        hide_redundant_mail_list_tool(&mut tools, true);
+        assert!(
+            !tools
+                .iter()
+                .any(|tool| tool["name"] == "mail_list_attachments")
+        );
+        assert!(is_redundant_mail_list("mail_list_attachments", true));
+        assert!(!is_redundant_mail_list("mail_save_attachment", true));
     }
 
     #[test]
