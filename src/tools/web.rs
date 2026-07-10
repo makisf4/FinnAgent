@@ -153,7 +153,9 @@ async fn client_for_public_url(url: Url) -> Result<(Client, Url)> {
 }
 
 fn is_public_ip(ip: IpAddr) -> bool {
-    match ip {
+    // Classify IPv4-mapped IPv6 addresses (::ffff:10.0.0.1) by their embedded
+    // IPv4 address so private ranges cannot slip the check in IPv6 form.
+    match ip.to_canonical() {
         IpAddr::V4(ip) => is_public_ipv4(ip),
         IpAddr::V6(ip) => is_public_ipv6(ip),
     }
@@ -199,10 +201,15 @@ mod tests {
             "fc00::1",
             "fe80::1",
             "2001:db8::1",
+            "::ffff:127.0.0.1",
+            "::ffff:10.0.0.1",
+            "::ffff:192.168.1.1",
+            "::ffff:169.254.1.1",
         ] {
             assert!(!is_public_ip(address.parse().unwrap()), "{address}");
         }
         assert!(is_public_ip("8.8.8.8".parse().unwrap()));
         assert!(is_public_ip("2606:4700:4700::1111".parse().unwrap()));
+        assert!(is_public_ip("::ffff:8.8.8.8".parse().unwrap()));
     }
 }
