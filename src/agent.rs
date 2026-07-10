@@ -133,6 +133,7 @@ impl Agent {
     }
 
     pub async fn run_task(&mut self, task: &str) -> Result<TaskResult> {
+        self.tools.begin_task();
         if self.config.model_kind == ModelKind::ImageGeneration {
             return self.run_image_generation_task(task).await;
         }
@@ -158,6 +159,7 @@ impl Agent {
         data_url: &str,
         log_task: &str,
     ) -> Result<TaskResult> {
+        self.tools.begin_task();
         if self.config.model_kind == ModelKind::ImageGeneration {
             bail!(
                 "{} is an image-generation model. Enter a text prompt to generate an image, or select an assistant model to analyze this file.",

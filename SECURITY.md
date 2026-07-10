@@ -40,6 +40,12 @@ from files, filenames, images, Mail, and command output are untrusted.
   OpenRouter server-tool events are removed from the client function-call loop;
   local mutations remain limited to capabilities explicitly derived from the
   original user request.
+- Task provenance: files a task itself creates through authorized writes stay
+  readable and writable for the remainder of that task, even under
+  untrusted-context restrictions. Reading back a task's own output reveals
+  nothing the model did not already hold, and the provenance set is populated
+  only from successful tool results, never from model claims. It is cleared
+  when the task ends.
 - OOXML inputs are scanned before parsing. XML tags larger than 64 KiB or with
   more than 256 attributes are rejected before upstream document libraries see
   the content.

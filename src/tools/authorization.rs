@@ -280,14 +280,16 @@ impl TaskAuthorization {
         }
         if content {
             bail!(
-                "file content read denied: after reading untrusted mail, the exact file name must appear in the user's current task"
+                "file content read denied: untrusted external data is active and {} is not named in the user's current task; the exact file name must appear in the request to authorize reading its content",
+                path.display()
             );
         }
         if self.path_location_allowed(path, home) {
             Ok(())
         } else {
             bail!(
-                "filesystem read denied: the user's current task did not name this file or location"
+                "filesystem read denied: the user's current task did not name {} or its location",
+                path.display()
             )
         }
     }
@@ -308,7 +310,8 @@ impl TaskAuthorization {
             Ok(())
         } else {
             bail!(
-                "write path denied: after reading untrusted mail, the user's current task must name the destination file or Desktop/Documents/Downloads location"
+                "write path denied: untrusted external data is active and the user's current task must name {} or its Desktop/Documents/Downloads location",
+                path.display()
             )
         }
     }

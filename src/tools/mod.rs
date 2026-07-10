@@ -8,9 +8,11 @@ mod schema;
 mod sysinfo;
 mod web;
 
+use std::collections::HashSet;
 use std::env;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
@@ -25,6 +27,13 @@ pub struct ToolContext {
     data_dir: PathBuf,
     confirmer: Confirmer,
     codex_sessions: codex::SessionStore,
+    /// Canonical paths of files and directories created by tools during the
+    /// current task. Task-scoped provenance: reading back an output the task
+    /// itself produced reveals nothing the model did not already have, so
+    /// these paths stay readable and writable under untrusted-context
+    /// restrictions. Cleared by `begin_task` so bindings never outlive the
+    /// task that earned them.
+    task_created_paths: Arc<Mutex<HashSet<PathBuf>>>,
 }
 
 /// Returns only capabilities authorized by the current user request.
@@ -99,7 +108,80 @@ impl ToolContext {
             data_dir,
             confirmer,
             codex_sessions: codex::SessionStore::default(),
+            task_created_paths: Arc::new(Mutex::new(HashSet::new())),
         }
+    }
+
+    /// Clears task-scoped state. The agent calls this at the start of every
+    /// user task so provenance bindings from one task cannot authorize reads
+    /// in a later one.
+    pub fn begin_task(&self) {
+        self.task_created_paths
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+    }
+
+    /// Records a path that a tool successfully created during this task.
+    /// Canonicalized so later checks are not fooled by an alternate spelling
+    /// of the same location.
+    fn note_created(&self, path: &Path) {
+        let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        self.task_created_paths
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(canonical);
+    }
+
+    fn created_by_task(&self, path: &Path) -> bool {
+        let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        self.task_created_paths
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(&canonical)
+    }
+
+    /// Read authorization with task provenance: outputs this task created are
+    /// always readable; anything else defers to the deterministic
+    /// authorization derived from the user's request.
+    fn require_read(
+        &self,
+        authorization: TaskAuthorization,
+        path: &Path,
+        content: bool,
+    ) -> Result<()> {
+        if self.created_by_task(path) {
+            return Ok(());
+        }
+        authorization.require_read_path(path, &self.home, content)
+    }
+
+    /// Write authorization with task provenance, mirroring `require_read`.
+    fn require_write(&self, authorization: TaskAuthorization, path: &Path) -> Result<()> {
+        if self.created_by_task(path) {
+            return Ok(());
+        }
+        authorization.require_write_path(path, &self.home)
+    }
+
+    /// Maps a create-type tool to the path it produces, so successful calls
+    /// can be recorded as task provenance.
+    fn creation_target(&self, name: &str, args: &Value) -> Option<PathBuf> {
+        let argument = match name {
+            "write_file"
+            | "document_create"
+            | "spreadsheet_update"
+            | "create_directory"
+            | "download_url"
+            | "mail_save_attachment" => "path",
+            "document_replace_text"
+            | "pdf_replace_text"
+            | "pdf_transform_pages"
+            | "image_transform" => "output_path",
+            _ => return None,
+        };
+        let raw = args.get(argument).and_then(Value::as_str)?;
+        Some(filesystem::resolve_path(raw, &self.home))
     }
 
     pub async fn execute(
@@ -155,23 +237,23 @@ impl ToolContext {
         let args: Value = serde_json::from_str(arguments)
             .with_context(|| format!("invalid arguments for tool {name}"))?;
 
-        match name {
+        let result = match name {
             "path_status" => {
                 let path = self.path_arg(&args)?;
                 filesystem::ensure_not_sensitive(&path, &self.home)?;
-                authorization.require_read_path(&path, &self.home, false)?;
+                self.require_read(authorization, &path, false)?;
                 filesystem::path_status(&path).await
             }
             "list_directory" => {
                 let path = self.path_arg(&args)?;
                 filesystem::ensure_not_sensitive(&path, &self.home)?;
-                authorization.require_read_path(&path, &self.home, false)?;
+                self.require_read(authorization, &path, false)?;
                 filesystem::list_directory(&path, required_u64(&args, "limit")? as usize).await
             }
             "find_files" => {
                 let path = self.path_arg(&args)?;
                 filesystem::ensure_not_sensitive(&path, &self.home)?;
-                authorization.require_read_path(&path, &self.home, false)?;
+                self.require_read(authorization, &path, false)?;
                 filesystem::find_files(
                     &path,
                     required_str(&args, "query")?,
@@ -183,7 +265,7 @@ impl ToolContext {
             "find_large_files" => {
                 let path = self.path_arg(&args)?;
                 filesystem::ensure_not_sensitive(&path, &self.home)?;
-                authorization.require_read_path(&path, &self.home, false)?;
+                self.require_read(authorization, &path, false)?;
                 filesystem::find_large_files(
                     &path,
                     required_u64(&args, "min_size_mb")?,
@@ -194,19 +276,19 @@ impl ToolContext {
             "read_file" => {
                 let path = self.path_arg(&args)?;
                 filesystem::ensure_not_sensitive(&path, &self.home)?;
-                authorization.require_read_path(&path, &self.home, true)?;
+                self.require_read(authorization, &path, true)?;
                 filesystem::read_file(&path, required_u64(&args, "max_bytes")? as usize).await
             }
             "artifact_read" => {
                 let path = self.path_arg(&args)?;
                 filesystem::ensure_not_sensitive(&path, &self.home)?;
-                authorization.require_read_path(&path, &self.home, true)?;
+                self.require_read(authorization, &path, true)?;
                 artifacts::read_artifact(&path, required_u64(&args, "max_chars")? as usize)
             }
             "document_create" => {
                 let path = self.path_arg(&args)?;
                 filesystem::ensure_not_sensitive(&path, &self.home)?;
-                authorization.require_write_path(&path, &self.home)?;
+                self.require_write(authorization, &path)?;
                 authorization.require_overwrite(required_bool(&args, "overwrite")?)?;
                 self.confirm_overwrite(
                     "document_create",
@@ -226,8 +308,8 @@ impl ToolContext {
                 let output = self.named_path_arg(&args, "output_path")?;
                 filesystem::ensure_not_sensitive(&input, &self.home)?;
                 filesystem::ensure_not_sensitive(&output, &self.home)?;
-                authorization.require_read_path(&input, &self.home, true)?;
-                authorization.require_write_path(&output, &self.home)?;
+                self.require_read(authorization, &input, true)?;
+                self.require_write(authorization, &output)?;
                 authorization.require_overwrite(required_bool(&args, "overwrite")?)?;
                 self.confirm_overwrite(
                     "document_replace_text",
@@ -246,7 +328,7 @@ impl ToolContext {
             "spreadsheet_update" => {
                 let path = self.path_arg(&args)?;
                 filesystem::ensure_not_sensitive(&path, &self.home)?;
-                authorization.require_write_path(&path, &self.home)?;
+                self.require_write(authorization, &path)?;
                 artifacts::update_spreadsheet(
                     &path,
                     required_str(&args, "sheet")?,
@@ -259,8 +341,8 @@ impl ToolContext {
                 let output = self.named_path_arg(&args, "output_path")?;
                 filesystem::ensure_not_sensitive(&input, &self.home)?;
                 filesystem::ensure_not_sensitive(&output, &self.home)?;
-                authorization.require_read_path(&input, &self.home, true)?;
-                authorization.require_write_path(&output, &self.home)?;
+                self.require_read(authorization, &input, true)?;
+                self.require_write(authorization, &output)?;
                 authorization.require_overwrite(required_bool(&args, "overwrite")?)?;
                 self.confirm_overwrite(
                     "pdf_replace_text",
@@ -282,8 +364,8 @@ impl ToolContext {
                 let output = self.named_path_arg(&args, "output_path")?;
                 filesystem::ensure_not_sensitive(&input, &self.home)?;
                 filesystem::ensure_not_sensitive(&output, &self.home)?;
-                authorization.require_read_path(&input, &self.home, true)?;
-                authorization.require_write_path(&output, &self.home)?;
+                self.require_read(authorization, &input, true)?;
+                self.require_write(authorization, &output)?;
                 authorization.require_overwrite(required_bool(&args, "overwrite")?)?;
                 self.confirm_overwrite(
                     "pdf_transform_pages",
@@ -305,8 +387,8 @@ impl ToolContext {
                 let output = self.named_path_arg(&args, "output_path")?;
                 filesystem::ensure_not_sensitive(&input, &self.home)?;
                 filesystem::ensure_not_sensitive(&output, &self.home)?;
-                authorization.require_read_path(&input, &self.home, true)?;
-                authorization.require_write_path(&output, &self.home)?;
+                self.require_read(authorization, &input, true)?;
+                self.require_write(authorization, &output)?;
                 authorization.require_overwrite(required_bool(&args, "overwrite")?)?;
                 self.confirm_overwrite(
                     "image_transform",
@@ -329,7 +411,7 @@ impl ToolContext {
             "write_file" => {
                 let path = self.path_arg(&args)?;
                 filesystem::ensure_not_sensitive(&path, &self.home)?;
-                authorization.require_write_path(&path, &self.home)?;
+                self.require_write(authorization, &path)?;
                 authorization.require_overwrite(required_bool(&args, "overwrite")?)?;
                 self.confirm_overwrite("write_file", required_bool(&args, "overwrite")?, &path)
                     .await?;
@@ -343,7 +425,7 @@ impl ToolContext {
             "create_directory" => {
                 let path = self.path_arg(&args)?;
                 filesystem::ensure_not_sensitive(&path, &self.home)?;
-                authorization.require_write_path(&path, &self.home)?;
+                self.require_write(authorization, &path)?;
                 filesystem::create_directory(&path).await
             }
             "move_to_trash" => {
@@ -382,7 +464,7 @@ impl ToolContext {
             "download_url" => {
                 let destination = self.path_arg(&args)?;
                 filesystem::ensure_not_sensitive(&destination, &self.home)?;
-                authorization.require_write_path(&destination, &self.home)?;
+                self.require_write(authorization, &destination)?;
                 authorization.require_overwrite(required_bool(&args, "overwrite")?)?;
                 self.confirm_overwrite(
                     "download_url",
@@ -422,7 +504,7 @@ impl ToolContext {
             "mail_save_attachment" => {
                 let destination = self.path_arg(&args)?;
                 filesystem::ensure_not_sensitive(&destination, &self.home)?;
-                authorization.require_write_path(&destination, &self.home)?;
+                self.require_write(authorization, &destination)?;
                 authorization.require_overwrite(required_bool(&args, "overwrite")?)?;
                 self.confirm_overwrite(
                     "mail_save_attachment",
@@ -464,7 +546,11 @@ impl ToolContext {
                 mail::send(to, subject, required_str(&args, "body")?, &attachments).await
             }
             _ => bail!("unknown tool: {name}"),
+        }?;
+        if let Some(path) = self.creation_target(name, &args) {
+            self.note_created(&path);
         }
+        Ok(result)
     }
 
     fn path_arg(&self, args: &Value) -> Result<PathBuf> {
@@ -861,5 +947,152 @@ mod tests {
             )
             .await;
         assert!(redirected.contains("recipient must be an explicit email address"));
+    }
+
+    #[test]
+    fn creation_targets_cover_output_tools_only() {
+        let context = ToolContext::new(
+            PathBuf::from("/Users/tester"),
+            PathBuf::from("/Users/tester/data"),
+            Confirmer::AutoDeny,
+        );
+        assert_eq!(
+            context.creation_target("write_file", &json!({"path": "/tmp/a.txt"})),
+            Some(PathBuf::from("/tmp/a.txt"))
+        );
+        assert_eq!(
+            context.creation_target("image_transform", &json!({"output_path": "/tmp/b.png"})),
+            Some(PathBuf::from("/tmp/b.png"))
+        );
+        assert_eq!(
+            context.creation_target("download_url", &json!({"path": "/tmp/c.jpg"})),
+            Some(PathBuf::from("/tmp/c.jpg"))
+        );
+        assert_eq!(
+            context.creation_target("read_file", &json!({"path": "/tmp/a.txt"})),
+            None
+        );
+        assert_eq!(
+            context.creation_target("mail_send", &json!({"to": "a@example.com"})),
+            None
+        );
+    }
+
+    /// The gauntlet regression: after web research taints the session, a file
+    /// the task itself downloaded must remain transformable even though its
+    /// model-invented name never appeared in the user's request. Files the
+    /// task did not create stay denied, and provenance dies with the task.
+    #[tokio::test]
+    async fn task_created_files_remain_usable_under_untrusted_context() {
+        use image::{ImageBuffer, Rgb};
+
+        let directory = tempfile::tempdir().unwrap();
+        let desktop = directory.path().join("Desktop");
+        tokio::fs::create_dir_all(&desktop).await.unwrap();
+        let context = ToolContext::new(
+            directory.path().to_path_buf(),
+            directory.path().join("data"),
+            Confirmer::AutoAllow,
+        );
+        let authorization = TaskAuthorization::from_task(
+            "Search the web for a photo, download it to my Desktop, and convert it to a grayscale png",
+        )
+        .with_untrusted_context(true);
+
+        let input = desktop.join("photo-1234.png");
+        ImageBuffer::from_pixel(8, 4, Rgb([20_u8, 40, 60]))
+            .save(&input)
+            .unwrap();
+        let output = desktop.join("photo-1234-gray.png");
+        let arguments = json!({
+            "input_path": input.to_string_lossy(),
+            "output_path": output.to_string_lossy(),
+            "operation": "grayscale",
+            "x": 0, "y": 0, "width": 0, "height": 0, "degrees": 0,
+            "overwrite": false
+        })
+        .to_string();
+
+        // Control: the file exists but was not created by this task and its
+        // name is not in the request, so the content read is denied.
+        let denied = context
+            .execute("image_transform", &arguments, authorization)
+            .await;
+        assert!(denied.contains("file content read denied"));
+        assert!(denied.contains("photo-1234.png"), "{denied}");
+        assert!(!output.exists());
+
+        // Simulate the task itself having downloaded the file.
+        context.note_created(&input);
+        let allowed = context
+            .execute("image_transform", &arguments, authorization)
+            .await;
+        assert!(!allowed.starts_with("ERROR"), "{allowed}");
+        assert!(output.exists());
+
+        // A new task clears provenance: the same call is denied again.
+        context.begin_task();
+        let cleared = context
+            .execute("image_transform", &arguments, authorization)
+            .await;
+        assert!(cleared.contains("file content read denied"));
+    }
+
+    /// End-to-end through the dispatcher: a successful write_file registers
+    /// provenance, so the task can read back its own output while pre-existing
+    /// files with unnamed paths stay unreadable.
+    #[tokio::test]
+    async fn dispatcher_registers_provenance_for_created_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let desktop = directory.path().join("Desktop");
+        tokio::fs::create_dir_all(&desktop).await.unwrap();
+        let context = ToolContext::new(
+            directory.path().to_path_buf(),
+            directory.path().join("data"),
+            Confirmer::AutoAllow,
+        );
+        let authorization = TaskAuthorization::from_task(
+            "Search the web, then write summary.txt and other notes on my Desktop and read them back",
+        )
+        .with_untrusted_context(true);
+
+        let generated = desktop.join("generated-note.txt");
+        let written = context
+            .execute(
+                "write_file",
+                &json!({
+                    "path": generated.to_string_lossy(),
+                    "content": "produced by this task",
+                    "overwrite": false
+                })
+                .to_string(),
+                authorization,
+            )
+            .await;
+        assert!(written.contains("status: complete"), "{written}");
+
+        let read_back = context
+            .execute(
+                "read_file",
+                &json!({"path": generated.to_string_lossy(), "max_bytes": 1024}).to_string(),
+                authorization,
+            )
+            .await;
+        assert!(read_back.contains("produced by this task"), "{read_back}");
+
+        // A pre-existing file whose name is not in the task stays denied.
+        let existing = desktop.join("existing-note.txt");
+        tokio::fs::write(&existing, b"pre-existing secret")
+            .await
+            .unwrap();
+        let denied = context
+            .execute(
+                "read_file",
+                &json!({"path": existing.to_string_lossy(), "max_bytes": 1024}).to_string(),
+                authorization,
+            )
+            .await;
+        assert!(denied.contains("file content read denied"), "{denied}");
+        assert!(denied.contains("existing-note.txt"));
     }
 }

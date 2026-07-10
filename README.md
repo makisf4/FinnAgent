@@ -238,6 +238,13 @@ directory inspection and writes can be scoped to Desktop, Documents, or
 Downloads when that location is named. This intentionally rejects ambiguous
 requests after Mail data has entered the session.
 
+Files the current task itself creates — downloads, written documents,
+transformed outputs — remain readable and writable for the remainder of that
+task even when their names were chosen mid-task. Reading back an output the
+task just produced reveals nothing new, and a file only enters this set
+through a write that already passed authorization. The provenance set is
+cleared when the task ends.
+
 Email content still has to be sent to the configured model provider for language
 processing. With the default GLM configuration, that means OpenRouter. Use a
 provider and account whose data-handling terms are appropriate for the mail you
