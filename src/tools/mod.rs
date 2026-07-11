@@ -200,12 +200,8 @@ impl ToolContext {
     /// can be recorded as task provenance.
     fn creation_target(&self, name: &str, args: &Value) -> Option<PathBuf> {
         let argument = match name {
-            "write_file"
-            | "document_create"
-            | "spreadsheet_update"
-            | "create_directory"
-            | "download_url"
-            | "mail_save_attachment" => "path",
+            "write_file" | "document_create" | "spreadsheet_update" | "create_directory"
+            | "download_url" => "path",
             "document_replace_text"
             | "pdf_replace_text"
             | "pdf_transform_pages"
@@ -525,6 +521,7 @@ impl ToolContext {
                     required_str(&args, "extension")?,
                     required_str(&args, "mailbox")?,
                     required_u64(&args, "limit")? as usize,
+                    required_str(&args, "after_date")?,
                 )
                 .await
             }
@@ -543,24 +540,30 @@ impl ToolContext {
                 .await
             }
             "mail_save_attachment" => {
-                let destination = self.path_arg(&args)?;
+                let requested_destination = self.path_arg(&args)?;
+                let requested_overwrite = required_bool(&args, "overwrite")?;
+                let overwrite_allowed =
+                    authorization.require_overwrite(requested_overwrite).is_ok();
+                let effective_overwrite = requested_overwrite && overwrite_allowed;
+                let destination = if effective_overwrite {
+                    requested_destination
+                } else {
+                    mail::unique_destination(&requested_destination)
+                };
                 filesystem::ensure_not_sensitive(&destination, &self.home)?;
                 self.require_write(authorization, &destination)?;
-                authorization.require_overwrite(required_bool(&args, "overwrite")?)?;
-                self.confirm_overwrite(
-                    "mail_save_attachment",
-                    required_bool(&args, "overwrite")?,
-                    &destination,
-                )
-                .await?;
-                mail::save_attachment(
+                self.confirm_overwrite("mail_save_attachment", effective_overwrite, &destination)
+                    .await?;
+                let result = mail::save_attachment(
                     required_u64(&args, "message_id")?,
                     required_str(&args, "mailbox")?,
                     required_u64(&args, "attachment_index")? as usize,
                     &destination,
-                    required_bool(&args, "overwrite")?,
+                    effective_overwrite,
                 )
-                .await
+                .await?;
+                self.note_created(&destination);
+                Ok(result)
             }
             "mail_send" => {
                 authorization.require_mail_send()?;

@@ -25,6 +25,7 @@ pub struct TaskAuthorization {
     allow_file_read: bool,
     allow_file_content_read: bool,
     allow_mail_read: bool,
+    prefer_mail_recent_attachments: bool,
     allow_system_info: bool,
     authorized_recipient_hashes: [u64; 4],
     authorized_recipient_count: u8,
@@ -90,6 +91,7 @@ impl TaskAuthorization {
             allow_file_read: capabilities.file_read,
             allow_file_content_read: capabilities.file_content_read,
             allow_mail_read: capabilities.mail_read,
+            prefer_mail_recent_attachments: capabilities.mail_attachment_save,
             allow_system_info: capabilities.system_info,
             authorized_recipient_hashes: bindings.recipient_hashes,
             authorized_recipient_count: bindings.recipient_count,
@@ -168,7 +170,11 @@ impl TaskAuthorization {
                     "mail_save_attachment denied: the user did not explicitly ask to save, copy, download, move, or extract an attachment"
                 )
             }
-            "mail_search" | "mail_recent_attachments" | "mail_read" | "mail_list_attachments"
+            "mail_search" if self.allow_mail_read && !self.prefer_mail_recent_attachments => Ok(()),
+            "mail_search" if self.prefer_mail_recent_attachments => bail!(
+                "mail_search denied: attachment-saving workflows must use mail_recent_attachments"
+            ),
+            "mail_recent_attachments" | "mail_read" | "mail_list_attachments"
                 if self.allow_mail_read =>
             {
                 Ok(())
@@ -1336,6 +1342,7 @@ mod tests {
         ] {
             assert!(authorization.require_tool(tool).is_ok(), "missing {tool}");
         }
+        assert!(authorization.require_tool("mail_search").is_err());
     }
 
     #[test]

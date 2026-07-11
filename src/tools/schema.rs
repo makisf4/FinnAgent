@@ -279,7 +279,7 @@ pub fn definitions() -> Vec<Value> {
         ),
         function(
             "mail_search",
-            "Search an Apple Mail mailbox by sender or subject and return message IDs and attachment counts.",
+            "Search a bounded newest-first slice of an Apple Mail mailbox by sender or subject and return message IDs and attachment counts. Do not use this for attachment-saving workflows; use mail_recent_attachments.",
             object_schema(&[
                 ("query", string_schema("Sender or subject fragment")),
                 (
@@ -294,7 +294,7 @@ pub fn definitions() -> Vec<Value> {
         ),
         function(
             "mail_recent_attachments",
-            "Find and rank the newest Apple Mail attachments without scanning the whole mailbox. Use this for latest/recent attachments or a file type such as PDF. Exact query matches are listed first; bounded recent candidates follow when there are not enough exact matches. Returns message IDs and 1-based attachment indexes for mail_save_attachment.",
+            "Find Apple Mail attachments newest-first by sender, subject, filename, file type, and optional cutoff date. Email-address queries are strict and skip unrelated attachments. Use this for every attachment-saving workflow. Returns message IDs and 1-based attachment indexes for mail_save_attachment.",
             object_schema(&[
                 (
                     "query",
@@ -321,6 +321,12 @@ pub fn definitions() -> Vec<Value> {
                 (
                     "limit",
                     integer_schema("Maximum matching attachments, from 1 to 20"),
+                ),
+                (
+                    "after_date",
+                    string_schema(
+                        "Inclusive cutoff in YYYY-MM-DD format; use an empty string when no cutoff was requested",
+                    ),
                 ),
             ]),
         ),
@@ -360,7 +366,7 @@ pub fn definitions() -> Vec<Value> {
         ),
         function(
             "mail_save_attachment",
-            "Save one Apple Mail attachment to an exact local file path. Use an index returned by mail_recent_attachments, or call mail_list_attachments first, and pass the same mailbox.",
+            "Save one Apple Mail attachment to a local file path. Use an index returned by mail_recent_attachments and pass the same mailbox. If the path exists and overwrite was not explicitly authorized, Finn safely selects a numbered filename instead of replacing it; always use the returned path.",
             object_schema(&[
                 (
                     "message_id",

@@ -12,6 +12,7 @@ use tokio::time::timeout;
 const MAIL_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_MAIL_OUTPUT: usize = 128 * 1024;
 const RECENT_ATTACHMENT_SCAN_LIMIT: usize = 2_000;
+const DATED_ATTACHMENT_SCAN_LIMIT: usize = 10_000;
 const RECENT_ATTACHMENT_CANDIDATE_LIMIT: usize = 25;
 
 pub async fn search(query: &str, mailbox_scope: &str, limit: usize) -> Result<String> {
@@ -21,6 +22,7 @@ on run argv
     set queryText to item 1 of argv
     set resultLimit to (item 2 of argv) as integer
     set mailboxScope to item 3 of argv
+    set scanLimit to (item 4 of argv) as integer
     set outputLines to {}
     ignoring case
         tell application "Mail"
@@ -35,12 +37,12 @@ on run argv
             else
                 set sourceMailbox to drafts mailbox
             end if
-            if queryText is "" then
-                set matchingMessages to messages of sourceMailbox
-            else
-                set matchingMessages to (every message of sourceMailbox whose (subject contains queryText or sender contains queryText))
-            end if
-            repeat with messageItem in matchingMessages
+            set allMessages to messages of sourceMailbox
+            set scanCount to count of allMessages
+            if scanCount is greater than scanLimit then set scanCount to scanLimit
+            if scanCount is 0 then return ""
+            set messageItems to items 1 through scanCount of allMessages
+            repeat with messageItem in messageItems
                 set messageSubject to subject of messageItem
                 set messageSender to sender of messageItem
                 if messageSubject contains queryText or messageSender contains queryText then
@@ -64,13 +66,20 @@ end joinLines
 "#;
     let output = run_osascript(
         script,
-        &[query, &limit.clamp(1, 100).to_string(), mailbox_scope],
+        &[
+            query,
+            &limit.clamp(1, 100).to_string(),
+            mailbox_scope,
+            &RECENT_ATTACHMENT_SCAN_LIMIT.to_string(),
+        ],
     )
     .await?;
     Ok(if output.trim().is_empty() {
         format!("no matching messages in {mailbox_scope}")
     } else {
-        format!("mailbox: {mailbox_scope}\nid\tsender\tsubject\tdate\tattachments\n{output}")
+        format!(
+            "mailbox: {mailbox_scope}\nscan: newest-first, at most {RECENT_ATTACHMENT_SCAN_LIMIT} messages\nid\tsender\tsubject\tdate\tattachments\n{output}"
+        )
     })
 }
 
@@ -79,10 +88,21 @@ pub async fn recent_attachments(
     extension: &str,
     mailbox_scope: &str,
     limit: usize,
+    after_date: &str,
 ) -> Result<String> {
     validate_mailbox_scope(mailbox_scope)?;
     validate_attachment_extension(extension)?;
+    let cutoff = parse_after_date(after_date)?;
     let invoice_query = invoice_like_query(query).to_string();
+    let strict_query = query.contains('@').to_string();
+    let (cutoff_enabled, cutoff_year, cutoff_month, cutoff_day) = cutoff
+        .map(|(year, month, day)| (true, year, month, day))
+        .unwrap_or((false, 0, 0, 0));
+    let scan_limit = if cutoff_enabled {
+        DATED_ATTACHMENT_SCAN_LIMIT
+    } else {
+        RECENT_ATTACHMENT_SCAN_LIMIT
+    };
     let script = r#"
 on run argv
     set queryText to item 1 of argv
@@ -92,6 +112,11 @@ on run argv
     set scanLimit to (item 5 of argv) as integer
     set candidateLimit to (item 6 of argv) as integer
     set invoiceQuery to (item 7 of argv) is "true"
+    set strictQuery to (item 8 of argv) is "true"
+    set cutoffEnabled to (item 9 of argv) is "true"
+    set cutoffYear to (item 10 of argv) as integer
+    set cutoffMonth to (item 11 of argv) as integer
+    set cutoffDay to (item 12 of argv) as integer
     set matchingLines to {}
     set fallbackLines to {}
     ignoring case
@@ -109,6 +134,13 @@ on run argv
             end if
 
             set allMessages to messages of sourceMailbox
+            if cutoffEnabled then
+                set cutoffDate to current date
+                set year of cutoffDate to cutoffYear
+                set month of cutoffDate to cutoffMonth
+                set day of cutoffDate to cutoffDay
+                set time of cutoffDate to 0
+            end if
             set scanCount to count of allMessages
             if scanCount is greater than scanLimit then set scanCount to scanLimit
             if scanCount is 0 then return ""
@@ -118,37 +150,40 @@ on run argv
                 set messageSubject to subject of messageItem
                 set messageSender to sender of messageItem
                 set messageDate to date received of messageItem
+                if cutoffEnabled and messageDate < cutoffDate then exit repeat
                 set messageId to id of messageItem
                 set messageMatches to ((queryText is "") or (messageSubject contains queryText) or (messageSender contains queryText))
                 if invoiceQuery and ((messageSubject contains "invoice") or (messageSubject contains "τιμολ") or (messageSubject contains "απυ") or (messageSubject contains "receipt") or (messageSubject contains "παραστατ") or (messageSubject contains "απόδειξ") or (messageSubject contains "αποδείξ")) then set messageMatches to true
-                set attachmentItems to mail attachments of messageItem
-                repeat with attachmentIndex from 1 to count of attachmentItems
-                    set attachmentItem to item attachmentIndex of attachmentItems
-                    set attachmentName to name of attachmentItem
-                    set extensionMatches to ((extensionText is "any") or (attachmentName ends with ("." & extensionText)))
-                    set queryMatches to (messageMatches or (attachmentName contains queryText))
-                    if invoiceQuery and ((attachmentName contains "invoice") or (attachmentName contains "τιμολ") or (attachmentName contains "απυ") or (attachmentName contains "receipt") or (attachmentName contains "παραστατ") or (attachmentName contains "απόδειξ") or (attachmentName contains "αποδείξ")) then set queryMatches to true
-                    if extensionMatches then
-                        set attachmentSize to 0
-                        set isDownloaded to false
-                        try
-                            set attachmentSize to file size of attachmentItem
-                        end try
-                        try
-                            set isDownloaded to downloaded of attachmentItem
-                        end try
-                        set rowText to (queryMatches as text) & tab & (messageId as text) & tab & messageSender & tab & messageSubject & tab & (messageDate as text) & tab & (attachmentIndex as text) & tab & attachmentName & tab & (attachmentSize as text) & tab & (isDownloaded as text)
-                        if queryMatches then
-                            set end of matchingLines to rowText
-                        else
-                            set end of fallbackLines to rowText
+                if (strictQuery is false) or messageMatches then
+                    set attachmentItems to mail attachments of messageItem
+                    repeat with attachmentIndex from 1 to count of attachmentItems
+                        set attachmentItem to item attachmentIndex of attachmentItems
+                        set attachmentName to name of attachmentItem
+                        set extensionMatches to ((extensionText is "any") or (attachmentName ends with ("." & extensionText)))
+                        set queryMatches to (messageMatches or (attachmentName contains queryText))
+                        if invoiceQuery and ((attachmentName contains "invoice") or (attachmentName contains "τιμολ") or (attachmentName contains "απυ") or (attachmentName contains "receipt") or (attachmentName contains "παραστατ") or (attachmentName contains "απόδειξ") or (attachmentName contains "αποδείξ")) then set queryMatches to true
+                        if extensionMatches then
+                            set attachmentSize to 0
+                            set isDownloaded to false
+                            try
+                                set attachmentSize to file size of attachmentItem
+                            end try
+                            try
+                                set isDownloaded to downloaded of attachmentItem
+                            end try
+                            set rowText to (queryMatches as text) & tab & (messageId as text) & tab & messageSender & tab & messageSubject & tab & (messageDate as text) & tab & (attachmentIndex as text) & tab & attachmentName & tab & (attachmentSize as text) & tab & (isDownloaded as text)
+                            if queryMatches then
+                                set end of matchingLines to rowText
+                            else
+                                set end of fallbackLines to rowText
+                            end if
+                            if (count of matchingLines) is greater than or equal to resultLimit then exit repeat
+                            if (strictQuery is false) and ((count of matchingLines) + (count of fallbackLines)) is greater than or equal to candidateLimit then exit repeat
                         end if
-                        if (count of matchingLines) is greater than or equal to resultLimit then exit repeat
-                        if ((count of matchingLines) + (count of fallbackLines)) is greater than or equal to candidateLimit then exit repeat
-                    end if
-                end repeat
+                    end repeat
+                end if
                 if (count of matchingLines) is greater than or equal to resultLimit then exit repeat
-                if ((count of matchingLines) + (count of fallbackLines)) is greater than or equal to candidateLimit then exit repeat
+                if (strictQuery is false) and ((count of matchingLines) + (count of fallbackLines)) is greater than or equal to candidateLimit then exit repeat
             end repeat
         end tell
     end ignoring
@@ -170,15 +205,20 @@ end joinLines
             extension,
             mailbox_scope,
             &limit.clamp(1, 20).to_string(),
-            &RECENT_ATTACHMENT_SCAN_LIMIT.to_string(),
+            &scan_limit.to_string(),
             &RECENT_ATTACHMENT_CANDIDATE_LIMIT.to_string(),
             &invoice_query,
+            &strict_query,
+            &cutoff_enabled.to_string(),
+            &cutoff_year.to_string(),
+            &cutoff_month.to_string(),
+            &cutoff_day.to_string(),
         ],
     )
     .await?;
     Ok(if output.trim().is_empty() {
         format!(
-            "no matching {extension} attachments among the {RECENT_ATTACHMENT_SCAN_LIMIT} most recent messages in {mailbox_scope}"
+            "no matching {extension} attachments in the bounded newest-first scan of {mailbox_scope}"
         )
     } else {
         let candidate_count = output.lines().count();
@@ -187,7 +227,12 @@ end joinLines
             .filter(|line| line.starts_with("true\t"))
             .count();
         format!(
-            "mailbox: {mailbox_scope}\nquery_matches: {query_match_count}\ncandidates: {candidate_count}\nscan: newest-first; stops after {limit} query matches or {RECENT_ATTACHMENT_CANDIDATE_LIMIT} recent attachment candidates, with a hard cap of {RECENT_ATTACHMENT_SCAN_LIMIT} messages\nquery_match\tmessage_id\tsender\tsubject\tdate\tattachment_index\tattachment_name\tsize_bytes\tdownloaded\n{output}"
+            "mailbox: {mailbox_scope}\nquery_matches: {query_match_count}\ncandidates: {candidate_count}\nafter_date: {}\nscan: newest-first, hard cap {scan_limit} messages; email-address queries are strict and skip unrelated attachments\nquery_match\tmessage_id\tsender\tsubject\tdate\tattachment_index\tattachment_name\tsize_bytes\tdownloaded\n{output}",
+            if after_date.is_empty() {
+                "none"
+            } else {
+                after_date
+            }
         )
     })
 }
@@ -283,12 +328,24 @@ pub async fn save_attachment(
     }
     validate_save_destination(destination, overwrite).await?;
     let temporary_destination = temporary_save_path(destination)?;
+    tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary_destination)
+        .await
+        .with_context(|| {
+            format!(
+                "cannot create Mail attachment staging file {}",
+                temporary_destination.display()
+            )
+        })?;
     let script = r#"
 on run argv
     set targetId to (item 1 of argv) as integer
     set mailboxScope to item 2 of argv
     set attachmentIndex to (item 3 of argv) as integer
     set destinationPath to item 4 of argv
+    set destinationAlias to (POSIX file destinationPath) as alias
     tell application "Mail"
         if mailboxScope is "inbox" then
             set sourceMailbox to inbox
@@ -307,7 +364,7 @@ on run argv
         set attachmentItems to mail attachments of messageItem
         if attachmentIndex is greater than (count of attachmentItems) then error "Attachment index is out of range."
         set attachmentItem to item attachmentIndex of attachmentItems
-        save attachmentItem in (POSIX file destinationPath)
+        save attachmentItem in destinationAlias
         return name of attachmentItem
     end tell
 end run
@@ -371,6 +428,29 @@ end run
         destination.display(),
         metadata.len()
     ))
+}
+
+pub fn unique_destination(destination: &Path) -> PathBuf {
+    if !destination.exists() {
+        return destination.to_path_buf();
+    }
+    let stem = destination
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("attachment");
+    let extension = destination
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| format!(".{value}"))
+        .unwrap_or_default();
+    let parent = destination.parent().unwrap_or_else(|| Path::new("."));
+    for suffix in 1_u32.. {
+        let candidate = parent.join(format!("{stem} ({suffix}){extension}"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    unreachable!()
 }
 
 pub async fn send(to: &str, subject: &str, body: &str, attachments: &[PathBuf]) -> Result<String> {
@@ -469,6 +549,39 @@ fn validate_attachment_extension(extension: &str) -> Result<()> {
     }
 }
 
+fn parse_after_date(value: &str) -> Result<Option<(i32, u32, u32)>> {
+    if value.is_empty() {
+        return Ok(None);
+    }
+    let mut parts = value.split('-');
+    let year = parts
+        .next()
+        .and_then(|part| part.parse::<i32>().ok())
+        .context("after_date must use YYYY-MM-DD")?;
+    let month = parts
+        .next()
+        .and_then(|part| part.parse::<u32>().ok())
+        .context("after_date must use YYYY-MM-DD")?;
+    let day = parts
+        .next()
+        .and_then(|part| part.parse::<u32>().ok())
+        .context("after_date must use YYYY-MM-DD")?;
+    if parts.next().is_some() || !(1970..=9999).contains(&year) || !(1..=12).contains(&month) {
+        bail!("after_date must be a valid YYYY-MM-DD date");
+    }
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let max_day = match month {
+        2 if leap => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    };
+    if day == 0 || day > max_day {
+        bail!("after_date must be a valid YYYY-MM-DD date");
+    }
+    Ok(Some((year, month, day)))
+}
+
 fn invoice_like_query(query: &str) -> bool {
     let query = query.to_lowercase();
     [
@@ -525,12 +638,21 @@ fn temporary_save_path(destination: &Path) -> Result<PathBuf> {
         .file_name()
         .and_then(|name| name.to_str())
         .context("attachment destination must have a valid file name")?;
+    let stem = destination
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or(file_name);
+    let extension = destination
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| format!(".{value}"))
+        .unwrap_or_default();
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    Ok(destination.with_file_name(format!(
-        ".{file_name}.finn-{}-{nonce}.tmp",
+    Ok(PathBuf::from("/private/tmp").join(format!(
+        "{stem}.finn-{}-{nonce}.tmp{extension}",
         std::process::id()
     )))
 }
@@ -631,8 +753,37 @@ mod tests {
         );
 
         let temporary = temporary_save_path(&destination).unwrap();
-        assert_eq!(temporary.parent(), destination.parent());
+        assert_eq!(temporary.parent(), Some(Path::new("/private/tmp")));
         assert_ne!(temporary, destination);
+        assert_eq!(
+            temporary.extension().and_then(|value| value.to_str()),
+            Some("pdf")
+        );
+        assert!(
+            !temporary
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with('.')
+        );
+    }
+
+    #[tokio::test]
+    async fn chooses_unique_attachment_destination_without_overwriting() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("invoice.pdf");
+        tokio::fs::write(&destination, b"original").await.unwrap();
+        tokio::fs::write(temp.path().join("invoice (1).pdf"), b"first")
+            .await
+            .unwrap();
+        assert_eq!(
+            unique_destination(&destination),
+            temp.path().join("invoice (2).pdf")
+        );
+        assert_eq!(
+            unique_destination(&temp.path().join("new.pdf")),
+            temp.path().join("new.pdf")
+        );
     }
 
     #[test]
@@ -667,10 +818,20 @@ mod tests {
         assert!(!invoice_like_query("project report"));
     }
 
+    #[test]
+    fn validates_optional_after_dates() {
+        assert_eq!(parse_after_date("").unwrap(), None);
+        assert_eq!(parse_after_date("2026-01-01").unwrap(), Some((2026, 1, 1)));
+        assert_eq!(parse_after_date("2024-02-29").unwrap(), Some((2024, 2, 29)));
+        for invalid in ["01/01/2026", "2026-02-29", "2026-13-01", "2026-01-00"] {
+            assert!(parse_after_date(invalid).is_err());
+        }
+    }
+
     #[tokio::test]
     #[ignore = "requires a configured Apple Mail account and Automation permission"]
     async fn finds_recent_pdf_attachments_in_live_mail() {
-        let result = recent_attachments("τιμολόγια", "pdf", "inbox", 5)
+        let result = recent_attachments("τιμολόγια", "pdf", "inbox", 5, "")
             .await
             .unwrap();
         assert!(result.contains("query_match\tmessage_id\tsender\tsubject\tdate"));
@@ -679,7 +840,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires a configured Apple Mail account and Automation permission"]
     async fn reads_and_lists_a_recent_live_message_by_id() {
-        let recent = recent_attachments("", "pdf", "inbox", 1).await.unwrap();
+        let recent = recent_attachments("", "pdf", "inbox", 1, "").await.unwrap();
         let row = recent
             .lines()
             .find(|line| line.starts_with("true\t") || line.starts_with("false\t"))
@@ -695,5 +856,44 @@ mod tests {
         assert!(message.starts_with("from: "));
         let attachments = list_attachments(message_id, "inbox").await.unwrap();
         assert!(attachments.starts_with("index\tname\tsize_bytes\tdownloaded"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a configured Apple Mail account and Automation permission"]
+    async fn searches_live_pdf_attachments_by_sender_and_cutoff_date() {
+        let result = recent_attachments("nsimeonakis@gmail.com", "pdf", "inbox", 20, "2026-01-01")
+            .await
+            .unwrap();
+        assert!(result.starts_with("mailbox:"), "expected matching PDFs");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Apple Mail Automation and writes one temporary Desktop attachment"]
+    async fn saves_a_live_attachment_through_visible_staging_path() {
+        let recent = recent_attachments("", "pdf", "inbox", 1, "").await.unwrap();
+        let row = recent
+            .lines()
+            .find(|line| line.starts_with("true\t") || line.starts_with("false\t"))
+            .expect("expected a recent PDF attachment row");
+        let fields = row.split('\t').collect::<Vec<_>>();
+        let message_id = fields[1].parse::<u64>().unwrap();
+        let attachment_index = fields[5].parse::<usize>().unwrap();
+        let home = PathBuf::from(env::var("HOME").unwrap());
+        let smoke_dir = home.join("Desktop").join(format!(
+            "FinnMailSaveSmoke-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+        ));
+        tokio::fs::create_dir(&smoke_dir).await.unwrap();
+        let destination = smoke_dir.join("attachment-smoke-test.pdf");
+
+        let result =
+            save_attachment(message_id, "inbox", attachment_index, &destination, false).await;
+        let _ = tokio::fs::remove_file(&destination).await;
+        let _ = tokio::fs::remove_dir(&smoke_dir).await;
+        assert!(result.is_ok(), "{result:?}");
     }
 }

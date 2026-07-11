@@ -43,8 +43,9 @@ Execution policy:
 - When the user asks to mail or email a report or file, include that file in mail_send attachments. Do not merely send its path as text.
 - A successful mail_send result means Apple Mail accepted the message for sending. Report that exact state; never claim recipient delivery.
 - Prefer dedicated filesystem and Mail tools over shell commands.
-- For latest/recent email attachments or a requested file type, use mail_recent_attachments; use mail_search for sender/subject searches. Prefer rows where query_match is true, then classify bounded fallback candidates from their sender, subject, and attachment name. Pass the returned message ID, attachment index, and mailbox directly to mail_save_attachment. After mail_recent_attachments succeeds, never call mail_list_attachments: its indexes are already authoritative. Search relevant mailbox scopes, including Trash when appropriate. Never search or modify Apple Mail's private storage directories directly.
+- For every email attachment search or save workflow, use mail_recent_attachments, including its after_date field when the user specifies a date; use mail_search only for messages when no attachment operation is requested. For a requested sender, pass the exact email address as query. Prefer rows where query_match is true, then classify bounded fallback candidates from their sender, subject, and attachment name. Pass the returned message ID, attachment index, and mailbox directly to mail_save_attachment. After mail_recent_attachments succeeds, never call mail_list_attachments: its indexes are already authoritative. Search relevant mailbox scopes, including Trash when appropriate. Never search or modify Apple Mail's private storage directories directly.
 - Never send test, probe, placeholder, empty-subject, or cleanup emails. A user task authorizes at most one intended outbound email. If the user named a file to send, create and verify that file first, then attach it; never call mail_send with an empty attachments array for that task.
+- For mail_save_attachment, normally pass overwrite false. If its requested path already exists, the tool safely chooses a numbered filename and returns the actual saved path; use that returned path for subsequent reads. Never retry the same attachment with overwrite true unless the user explicitly requested replacement.
 - Use artifact_read for DOCX, PDF, XLSX, TXT, and image inspection instead of read_file or shell utilities.
 - Use document_create and document_replace_text for TXT/DOCX work, spreadsheet_update for XLSX cells and formulas, the PDF tools for PDF text/pages, and image_transform for raster images.
 - After creating or changing an artifact, verify it with artifact_read or path_status before reporting success. Explain tool limitations precisely when a requested edit cannot preserve the source layout.
@@ -632,11 +633,21 @@ impl Agent {
 
     /// Switches the active model. Text turns are replayed onto the new
     /// backend, but tool-call results and image inputs from the previous
-    /// session are not portable across providers and are dropped. Returns the
-    /// number of prior text turns that were preserved so the caller can inform
-    /// the user.
+    /// session are not portable across providers and are dropped. If external
+    /// data tainted the session, even replaying assistant text could carry that
+    /// data across the trust boundary, so switching starts a clean session and
+    /// restores the new task's normal tool availability. Returns the number of
+    /// prior text turns that were preserved.
     pub fn switch_model(&mut self, config: Config) -> usize {
         let mut backend = Backend::new(&config);
+        if self.untrusted_external_context {
+            self.config = config;
+            self.backend = backend;
+            self.conversation.clear();
+            self.untrusted_external_context = false;
+            self.turn = 0;
+            return 0;
+        }
         for (task, answer) in &self.conversation {
             backend.push_user(task);
             backend.push_assistant(answer);
@@ -942,6 +953,38 @@ mod tests {
         // and the turn counter restarts from 1.
         assert!(requests[1].contains("second question"));
         assert!(!requests[1].contains("remember apples"));
+    }
+
+    #[test]
+    fn model_switch_resets_tainted_history_and_tool_context() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = Config {
+            api_key: "test-key".to_owned(),
+            base_url: "http://127.0.0.1:1".to_owned(),
+            model: "model-a".to_owned(),
+            model_kind: crate::config::ModelKind::Assistant,
+            vision_model: None,
+            reasoning_effort: "medium".to_owned(),
+            home: directory.path().to_path_buf(),
+            data_dir: directory.path().join("data"),
+        };
+        let tools = ToolContext::new(
+            config.home.clone(),
+            config.data_dir.clone(),
+            crate::tools::Confirmer::AutoAllow,
+        );
+        let mut agent = Agent::new(config.clone(), tools).unwrap();
+        agent
+            .conversation
+            .push(("read mail".to_owned(), "external data".to_owned()));
+        agent.untrusted_external_context = true;
+
+        let mut switched = config;
+        switched.model = "model-b".to_owned();
+        assert_eq!(agent.switch_model(switched), 0);
+        assert!(agent.conversation.is_empty());
+        assert!(!agent.untrusted_external_context);
+        assert_eq!(agent.turn, 0);
     }
 
     #[tokio::test]
