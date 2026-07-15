@@ -15,7 +15,7 @@ base64 = "0.22"
 docx-rs = "0.4.20"
 futures-util = { version = "0.3", default-features = false }
 image = { version = "0.25.10", default-features = false, features = ["gif", "jpeg", "png", "tiff", "webp"] }
-lopdf = "0.42"
+lopdf = "0.44"
 quick-xml = "0.41"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 rustyline = "17"
