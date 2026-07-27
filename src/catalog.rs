@@ -16,6 +16,7 @@ const OPENROUTER_ASSISTANT_MODELS: &[&str] = &[
     "x-ai/grok-4.3",
     "deepseek/deepseek-v4-pro",
     "qwen/qwen3.7-max",
+    "moonshotai/kimi-k3",
     "moonshotai/kimi-k2.7-code",
     "mistralai/mistral-medium-3-5",
     "minimax/minimax-m3",
@@ -162,12 +163,13 @@ mod tests {
         let openrouter = parse_models(
             r#"{"data":[
                 {"id":"z-ai/glm-5.2","architecture":{"output_modalities":["text"]},"supported_parameters":["tools"]},
+                {"id":"moonshotai/kimi-k3","architecture":{"output_modalities":["text"]},"supported_parameters":["tools"]},
                 {"id":"openai/gpt-image-2","architecture":{"output_modalities":["image"]},"supported_parameters":[]},
                 {"id":"openai/gpt-5.5","architecture":{"output_modalities":["text"]},"supported_parameters":["tools"]}
             ]}"#,
         )
         .unwrap();
-        assert_eq!(openrouter.len(), 3);
+        assert_eq!(openrouter.len(), 4);
         assert!(
             openrouter.iter().any(|model| {
                 model.id == "openai/gpt-5.5" && model.kind == ModelKind::Assistant
@@ -178,6 +180,9 @@ mod tests {
                 .iter()
                 .any(|model| { model.id == "z-ai/glm-5.2" && model.kind == ModelKind::Assistant })
         );
+        assert!(openrouter.iter().any(|model| {
+            model.id == "moonshotai/kimi-k3" && model.kind == ModelKind::Assistant
+        }));
         assert!(openrouter.iter().any(|model| {
             model.id == "openai/gpt-image-2" && model.kind == ModelKind::ImageGeneration
         }));

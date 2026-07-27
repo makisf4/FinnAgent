@@ -38,6 +38,7 @@ pub fn fallback_model_options() -> Vec<ModelOption> {
         ("x-ai/grok-4.3", ModelKind::Assistant),
         ("deepseek/deepseek-v4-pro", ModelKind::Assistant),
         ("qwen/qwen3.7-max", ModelKind::Assistant),
+        ("moonshotai/kimi-k3", ModelKind::Assistant),
         ("moonshotai/kimi-k2.7-code", ModelKind::Assistant),
         ("mistralai/mistral-medium-3-5", ModelKind::Assistant),
         ("minimax/minimax-m3", ModelKind::Assistant),
@@ -147,6 +148,10 @@ mod tests {
         }));
         assert!(models.contains(&ModelOption {
             id: "z-ai/glm-5.2".to_owned(),
+            kind: ModelKind::Assistant,
+        }));
+        assert!(models.contains(&ModelOption {
+            id: "moonshotai/kimi-k3".to_owned(),
             kind: ModelKind::Assistant,
         }));
         assert_eq!(
