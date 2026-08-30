@@ -399,7 +399,23 @@ impl ParsedIntent {
             "αποστολ",
         ]) || text.starts_with_word("email")
             || text.starts_with_word("mail");
-        let send_negated = text.has_phrase(&[
+        let explicitly_one_email = text.has_phrase(&[
+            "send exactly one email",
+            "send only one email",
+            "email exactly once",
+            "στειλε ακριβως ενα email",
+            "στειλε μονο ενα email",
+        ]);
+        let forbid_additional_email = text.has_phrase(&[
+            "do not send any other email",
+            "don't send any other email",
+            "dont send any other email",
+            "send no other email",
+            "μην στειλεις κανενα αλλο email",
+            "μη στειλεις κανενα αλλο email",
+        ]);
+        let bounded_single_send = explicitly_one_email && forbid_additional_email;
+        let send_negated = (text.has_phrase(&[
             "do not send",
             "don't send",
             "dont send",
@@ -411,8 +427,10 @@ impl ParsedIntent {
             "do not reply",
             "don't reply",
             "dont reply",
-        ]) || text.has_phrase(&["μη"]) && text.has_stem(&["στείλ", "στειλ"])
-            || text.has_phrase(&["χωρίς", "χωρις"]) && text.has_stem(&["αποστολ"]);
+        ]) || text.has_phrase(&["μη", "μην"])
+            && text.has_stem(&["στείλ", "στειλ"])
+            || text.has_phrase(&["χωρίς", "χωρις"]) && text.has_stem(&["αποστολ"]))
+            && !bounded_single_send;
         let transfer_action = text.has_phrase(&[
             "save", "copy", "download", "extract", "move", "put", "store", "βάλε", "βαλε",
         ]) || text.has_stem(&[
@@ -672,7 +690,8 @@ impl ParsedIntent {
             "επεξεργαστ",
         ]);
 
-        let (recipient_hashes, recipient_count) = extract_recipient_hashes(raw, send_action);
+        let (recipient_hashes, recipient_count) =
+            extract_recipient_hashes(raw, send_action, bounded_single_send);
         let (attachment_hashes, attachment_count) = extract_attachment_hashes(raw);
         let (target_hashes, target_count) = extract_target_hashes(raw);
         Self {
@@ -856,27 +875,35 @@ fn normalize_for_matching(task: &str) -> String {
         .collect()
 }
 
-fn extract_recipient_hashes(task: &str, send_action: bool) -> ([u64; 4], u8) {
+fn extract_recipient_hashes(
+    task: &str,
+    send_action: bool,
+    bounded_single_send: bool,
+) -> ([u64; 4], u8) {
     let mut hashes = [0_u64; 4];
     if !send_action {
         return (hashes, 0);
     }
     let normalized = normalize_for_matching(task);
-    let recipient_start = [
-        "send",
-        "forward",
-        "reply",
-        "email ",
-        "mail ",
-        "στειλ",
-        "προωθησ",
-        "απαντησ",
-        "αποστολ",
-    ]
-    .iter()
-    .filter_map(|marker| normalized.rfind(marker))
-    .max()
-    .unwrap_or(0);
+    let recipient_start = if bounded_single_send {
+        0
+    } else {
+        [
+            "send",
+            "forward",
+            "reply",
+            "email ",
+            "mail ",
+            "στειλ",
+            "προωθησ",
+            "απαντησ",
+            "αποστολ",
+        ]
+        .iter()
+        .filter_map(|marker| normalized.rfind(marker))
+        .max()
+        .unwrap_or(0)
+    };
     let recipient_scope = &normalized[recipient_start..];
     let mut count = 0_usize;
     for token in recipient_scope.split(|character: char| {
@@ -1346,6 +1373,33 @@ mod tests {
     }
 
     #[test]
+    fn single_email_limit_does_not_negate_the_requested_send() {
+        let task = "Στείλε ακριβώς ένα email στο safe@example.com με θέμα Σύνοψη τιμολογίων και επισύναψε το αρχείο ~/Desktop/Invoices/summary.xlsx. Μην στείλεις κανένα άλλο email.";
+        let authorization = TaskAuthorization::from_task(task).with_untrusted_context(true);
+        assert!(authorization.require_tool("mail_send").is_ok());
+        assert!(
+            authorization
+                .require_mail_recipient("safe@example.com")
+                .is_ok()
+        );
+        let attachment =
+            PathBuf::from(std::env::var_os("HOME").unwrap()).join("Desktop/Invoices/summary.xlsx");
+        assert!(
+            authorization
+                .require_outbound_attachments(&[attachment])
+                .is_ok()
+        );
+        let exposed = authorization.audit_snapshot(true);
+        assert!(
+            exposed["exposed_tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool == "mail_send")
+        );
+    }
+
+    #[test]
     fn derives_high_impact_authorization_from_original_task() {
         let mail = TaskAuthorization::from_task("Send the report to alex@example.com");
         assert!(mail.require_mail_send().is_ok());
@@ -1377,6 +1431,9 @@ mod tests {
 
         let negated = TaskAuthorization::from_task("Read it but do not send any email");
         assert!(negated.require_mail_send().is_err());
+
+        let greek_negated = TaskAuthorization::from_task("Μην στείλεις email στο safe@example.com");
+        assert!(greek_negated.require_mail_send().is_err());
 
         let imperative = TaskAuthorization::from_task("Please email the report to Alex");
         assert!(imperative.require_mail_send().is_err());
