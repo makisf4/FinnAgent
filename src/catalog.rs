@@ -8,9 +8,11 @@ use serde_json::Value;
 use crate::config::{ModelKind, ModelOption, fallback_model_options, provider_connection};
 
 const OPENROUTER_ASSISTANT_MODELS: &[&str] = &[
+    "moonshotai/kimi-k3",
+    "openai/gpt-5.6-terra",
+    "openai/gpt-5.5",
     "deepseek/deepseek-v4-pro",
     "deepseek/deepseek-v4-flash",
-    "moonshotai/kimi-k3",
     "z-ai/glm-5.3-flash",
 ];
 
@@ -147,11 +149,13 @@ mod tests {
                 {"id":"deepseek/deepseek-v4-flash","architecture":{"output_modalities":["text"]},"supported_parameters":["tools"]},
                 {"id":"openai/gpt-image-2","architecture":{"output_modalities":["image"]},"supported_parameters":[]},
                 {"id":"google/gemini-3.1-flash-image","architecture":{"output_modalities":["image"]},"supported_parameters":[]},
-                {"id":"openai/gpt-5.5","architecture":{"output_modalities":["text"]},"supported_parameters":["tools"]}
+                {"id":"openai/gpt-5.5","architecture":{"output_modalities":["text"]},"supported_parameters":["tools"]},
+                {"id":"openai/gpt-5.6-terra","architecture":{"output_modalities":["text"]},"supported_parameters":["tools"]},
+                {"id":"openai/gpt-5.6-sol","architecture":{"output_modalities":["text"]},"supported_parameters":["tools"]}
             ]}"#,
         )
         .unwrap();
-        assert_eq!(openrouter.len(), 6);
+        assert_eq!(openrouter.len(), 8);
         assert!(openrouter.iter().any(|model| {
             model.id == "z-ai/glm-5.3-flash" && model.kind == ModelKind::Assistant
         }));
@@ -164,12 +168,24 @@ mod tests {
         assert!(openrouter.iter().any(|model| {
             model.id == "deepseek/deepseek-v4-flash" && model.kind == ModelKind::Assistant
         }));
+        assert!(
+            openrouter.iter().any(|model| {
+                model.id == "openai/gpt-5.5" && model.kind == ModelKind::Assistant
+            })
+        );
+        assert!(openrouter.iter().any(|model| {
+            model.id == "openai/gpt-5.6-terra" && model.kind == ModelKind::Assistant
+        }));
         assert!(openrouter.iter().any(|model| {
             model.id == "openai/gpt-image-2" && model.kind == ModelKind::ImageGeneration
         }));
         assert!(openrouter.iter().any(|model| {
             model.id == "google/gemini-3.1-flash-image" && model.kind == ModelKind::ImageGeneration
         }));
-        assert!(!openrouter.iter().any(|model| model.id == "openai/gpt-5.5"));
+        assert!(
+            !openrouter
+                .iter()
+                .any(|model| model.id == "openai/gpt-5.6-sol")
+        );
     }
 }

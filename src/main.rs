@@ -15,7 +15,7 @@ use std::env;
 
 use agent::Agent;
 use anyhow::Result;
-use config::Config;
+use config::{Config, DEFAULT_MODEL};
 use prompt::{SlashHelper, normalize_multiline};
 use rustyline::config::BellStyle;
 use rustyline::error::ReadlineError;
@@ -34,7 +34,7 @@ async fn main() {
 async fn run() -> Result<()> {
     let args: Vec<String> = env::args().skip(1).collect();
     if args.first().is_some_and(|arg| arg == "--check") {
-        let model = env::var("FINN_MODEL").unwrap_or_else(|_| "z-ai/glm-5.3-flash".to_owned());
+        let model = env::var("FINN_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_owned());
         let reasoning = env::var("FINN_REASONING").unwrap_or_else(|_| "medium".to_owned());
         let key_name = "OPENROUTER_API_KEY";
         let key_status = if env::var(key_name).is_ok_and(|key| !key.trim().is_empty()) {

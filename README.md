@@ -15,7 +15,7 @@ Finn does not hand generated commands back to the user. An imperative task is au
 - Move exact files and folders to macOS Trash
 - Report read-only system information: OS, CPU, memory, and root-disk usage
 - Search for and download public HTTPS images or files to an exact local path
-- Optionally run explicitly requested Bash/Zsh commands in a secret-free subprocess
+- Delegate coding and shell-based work to Codex when explicitly requested
 - Search and read Apple Mail messages in Inbox, Trash, Junk, Sent, and Drafts
 - Find recent attachments by file type without scanning the whole mailbox, then list and save them
 - Send email with file attachments through Apple Mail when explicitly requested
@@ -67,11 +67,12 @@ download a photo of Larry Bird to my Desktop
 ```
 
 Type `/models` during an interactive session to choose a curated OpenRouter
-model or enter an exact custom model ID. The list includes DeepSeek, Kimi, Z.ai,
-and selected OpenAI and Google image-generation models. The change takes effect
-immediately. Prior text turns are replayed onto the new model, but tool results
-and image inputs are not carried over. The selection lasts for that Finn
-session; set `FINN_MODEL` to change the startup default.
+model or enter an exact custom model ID. The list includes Kimi, selected
+OpenAI, DeepSeek, and Z.ai assistant models, plus OpenAI and Google
+image-generation models. The change takes effect immediately. Prior text turns
+are replayed onto the new model, but tool results and image inputs are not
+carried over. The selection lasts for that Finn session; set `FINN_MODEL` to
+change the startup default.
 
 Type `/` and press `Tab` to open slash-command completion with descriptions.
 Partial commands such as `/mo` can be completed to `/model` or `/models`.
@@ -90,8 +91,8 @@ image to a vision-capable model. Finn reads and Base64-encodes the local file; i
 never asks the model to open the filesystem path directly.
 
 OpenRouter uses a unified hybrid orchestrator. Text turns route to `FINN_MODEL`
-(`z-ai/glm-5.3-flash` by default); image input and explicit visual-verification
-work route to `FINN_VISION_MODEL` (`z-ai/glm-5.3-flash` by default). The visual
+(`moonshotai/kimi-k3` by default); image input and explicit visual-verification
+work route to `FINN_VISION_MODEL` (`moonshotai/kimi-k3` by default). The visual
 route remains active through its tool loop. A later nonvisual user turn returns
 to the text model after recursively replacing image URLs, Base64 image data,
 multipart image objects, and visual data in tool-call arguments with a typed
@@ -123,8 +124,8 @@ cargo run --release -- --check
 |---|---|---|
 | `OPENROUTER_API_KEY` | required for OpenRouter | OpenRouter API authentication |
 | `OPENROUTER_BASE_URL` | `https://openrouter.ai/api/v1` | OpenRouter-compatible API base URL |
-| `FINN_MODEL` | `z-ai/glm-5.3-flash` | Startup OpenRouter model |
-| `FINN_VISION_MODEL` | `z-ai/glm-5.3-flash` | Model used automatically for local image input |
+| `FINN_MODEL` | `moonshotai/kimi-k3` | Startup OpenRouter model |
+| `FINN_VISION_MODEL` | `moonshotai/kimi-k3` | Model used automatically for local image input |
 | `FINN_REASONING` | `medium` | OpenRouter reasoning configuration |
 | `FINN_HOME` | `~/Library/Application Support/FinnAgent` | Local task log directory |
 | `FINN_TASK_LOG` | `off` | Set to `1`, `true`, `yes`, or `on` to retain local task summaries |
@@ -134,7 +135,8 @@ OpenRouter setup:
 
 ```bash
 export OPENROUTER_API_KEY="..."
-export FINN_MODEL="z-ai/glm-5.3-flash"
+export FINN_MODEL="moonshotai/kimi-k3"
+export FINN_VISION_MODEL="moonshotai/kimi-k3"
 cargo run --release
 ```
 
@@ -245,10 +247,9 @@ task just produced reveals nothing new, and a file only enters this set
 through a write that already passed authorization. The provenance set is
 cleared when the task ends.
 
-Email content still has to be sent to the configured model provider for language
-processing. With the default GLM configuration, that means OpenRouter. Use a
-provider and account whose data-handling terms are appropriate for the mail you
-ask Finn to process.
+Email content still has to be sent to OpenRouter for language processing. The
+default assistant model is Kimi K3. Use an OpenRouter account whose data-handling
+terms are appropriate for the mail you ask Finn to process.
 
 ## Artifact limits
 

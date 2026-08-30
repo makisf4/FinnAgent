@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 
 const DEFAULT_OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
-const DEFAULT_MODEL: &str = "z-ai/glm-5.3-flash";
+pub(crate) const DEFAULT_MODEL: &str = "moonshotai/kimi-k3";
 
 #[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
 pub enum ModelKind {
@@ -30,9 +30,11 @@ pub struct ModelOption {
 
 pub fn fallback_model_options() -> Vec<ModelOption> {
     [
+        ("moonshotai/kimi-k3", ModelKind::Assistant),
+        ("openai/gpt-5.6-terra", ModelKind::Assistant),
+        ("openai/gpt-5.5", ModelKind::Assistant),
         ("deepseek/deepseek-v4-pro", ModelKind::Assistant),
         ("deepseek/deepseek-v4-flash", ModelKind::Assistant),
-        ("moonshotai/kimi-k3", ModelKind::Assistant),
         ("z-ai/glm-5.3-flash", ModelKind::Assistant),
         ("openai/gpt-image-2", ModelKind::ImageGeneration),
         ("google/gemini-3.1-flash-image", ModelKind::ImageGeneration),
@@ -86,7 +88,7 @@ impl Config {
             model_kind: model_kind_for_id(&model),
             model,
             vision_model: Some(
-                env::var("FINN_VISION_MODEL").unwrap_or_else(|_| "z-ai/glm-5.3-flash".to_owned()),
+                env::var("FINN_VISION_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_owned()),
             ),
             reasoning_effort: env::var("FINN_REASONING").unwrap_or_else(|_| "medium".to_owned()),
             home,
@@ -121,8 +123,20 @@ mod tests {
     #[test]
     fn fallback_catalog_contains_assistant_and_image_models() {
         let models = fallback_model_options();
+        assert_eq!(
+            models.first().map(|model| model.id.as_str()),
+            Some(DEFAULT_MODEL)
+        );
         assert!(models.contains(&ModelOption {
             id: "deepseek/deepseek-v4-pro".to_owned(),
+            kind: ModelKind::Assistant,
+        }));
+        assert!(models.contains(&ModelOption {
+            id: "openai/gpt-5.5".to_owned(),
+            kind: ModelKind::Assistant,
+        }));
+        assert!(models.contains(&ModelOption {
+            id: "openai/gpt-5.6-terra".to_owned(),
             kind: ModelKind::Assistant,
         }));
         assert!(models.contains(&ModelOption {
@@ -145,6 +159,6 @@ mod tests {
             model_kind_for_id("google/gemini-3.1-flash-image"),
             ModelKind::ImageGeneration
         );
-        assert_eq!(models.len(), 6);
+        assert_eq!(models.len(), 8);
     }
 }
