@@ -34,7 +34,7 @@ async fn main() {
 async fn run() -> Result<()> {
     let args: Vec<String> = env::args().skip(1).collect();
     if args.first().is_some_and(|arg| arg == "--check") {
-        let model = env::var("FINN_MODEL").unwrap_or_else(|_| "z-ai/glm-5.2".to_owned());
+        let model = env::var("FINN_MODEL").unwrap_or_else(|_| "z-ai/glm-5.3-flash".to_owned());
         let reasoning = env::var("FINN_REASONING").unwrap_or_else(|_| "medium".to_owned());
         let key_name = "OPENROUTER_API_KEY";
         let key_status = if env::var(key_name).is_ok_and(|key| !key.trim().is_empty()) {

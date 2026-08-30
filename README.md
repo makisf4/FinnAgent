@@ -67,12 +67,11 @@ download a photo of Larry Bird to my Desktop
 ```
 
 Type `/models` during an interactive session to choose a curated OpenRouter
-model or enter an exact custom model ID. The list includes OpenAI, Anthropic,
-Google, xAI, DeepSeek, Qwen, Kimi, Mistral, MiniMax, Meta, Z.ai, and image
-generation models. The change takes effect immediately. Prior text turns are
-replayed onto the new model, but tool results and image inputs are not carried
-over. The selection lasts for that Finn session; set `FINN_MODEL` to change the
-startup default.
+model or enter an exact custom model ID. The list includes DeepSeek, Kimi, Z.ai,
+and selected OpenAI and Google image-generation models. The change takes effect
+immediately. Prior text turns are replayed onto the new model, but tool results
+and image inputs are not carried over. The selection lasts for that Finn
+session; set `FINN_MODEL` to change the startup default.
 
 Type `/` and press `Tab` to open slash-command completion with descriptions.
 Partial commands such as `/mo` can be completed to `/model` or `/models`.
@@ -91,13 +90,14 @@ image to a vision-capable model. Finn reads and Base64-encodes the local file; i
 never asks the model to open the filesystem path directly.
 
 OpenRouter uses a unified hybrid orchestrator. Text turns route to `FINN_MODEL`
-(`z-ai/glm-5.2` by default); image input and explicit visual-verification work
-route to `FINN_VISION_MODEL` (`z-ai/glm-5v-turbo` by default). The visual route
-remains active through its tool loop. A later nonvisual user turn returns to the
-text model after recursively replacing image URLs, Base64 image data, multipart
-image objects, and visual data in tool-call arguments with a typed sanitation
-marker. OpenRouter `reasoning_details` are retained exactly for subsequent turns
-on the model that produced them and are not forwarded across models.
+(`z-ai/glm-5.3-flash` by default); image input and explicit visual-verification
+work route to `FINN_VISION_MODEL` (`z-ai/glm-5.3-flash` by default). The visual
+route remains active through its tool loop. A later nonvisual user turn returns
+to the text model after recursively replacing image URLs, Base64 image data,
+multipart image objects, and visual data in tool-call arguments with a typed
+sanitation marker. OpenRouter `reasoning_details` are retained exactly for
+subsequent turns on the model that produced them and are not forwarded across
+models.
 
 Image understanding is supported through assistant models. When an image
 generation model is active, natural-language input is sent to OpenRouter's
@@ -123,8 +123,8 @@ cargo run --release -- --check
 |---|---|---|
 | `OPENROUTER_API_KEY` | required for OpenRouter | OpenRouter API authentication |
 | `OPENROUTER_BASE_URL` | `https://openrouter.ai/api/v1` | OpenRouter-compatible API base URL |
-| `FINN_MODEL` | `z-ai/glm-5.2` | Startup OpenRouter model |
-| `FINN_VISION_MODEL` | `z-ai/glm-5v-turbo` | Model used automatically for local image input |
+| `FINN_MODEL` | `z-ai/glm-5.3-flash` | Startup OpenRouter model |
+| `FINN_VISION_MODEL` | `z-ai/glm-5.3-flash` | Model used automatically for local image input |
 | `FINN_REASONING` | `medium` | OpenRouter reasoning configuration |
 | `FINN_HOME` | `~/Library/Application Support/FinnAgent` | Local task log directory |
 | `FINN_TASK_LOG` | `off` | Set to `1`, `true`, `yes`, or `on` to retain local task summaries |
@@ -134,7 +134,7 @@ OpenRouter setup:
 
 ```bash
 export OPENROUTER_API_KEY="..."
-export FINN_MODEL="z-ai/glm-5.2"
+export FINN_MODEL="z-ai/glm-5.3-flash"
 cargo run --release
 ```
 

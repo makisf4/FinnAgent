@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 
 const DEFAULT_OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
-const DEFAULT_MODEL: &str = "z-ai/glm-5.2";
+const DEFAULT_MODEL: &str = "z-ai/glm-5.3-flash";
 
 #[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
 pub enum ModelKind {
@@ -30,34 +30,12 @@ pub struct ModelOption {
 
 pub fn fallback_model_options() -> Vec<ModelOption> {
     [
-        ("openai/gpt-5.5", ModelKind::Assistant),
-        ("openai/gpt-5.4-mini", ModelKind::Assistant),
-        ("anthropic/claude-sonnet-5", ModelKind::Assistant),
-        ("anthropic/claude-opus-4.8", ModelKind::Assistant),
-        ("google/gemini-3.5-flash", ModelKind::Assistant),
-        ("x-ai/grok-4.3", ModelKind::Assistant),
         ("deepseek/deepseek-v4-pro", ModelKind::Assistant),
         ("deepseek/deepseek-v4-flash", ModelKind::Assistant),
-        ("qwen/qwen3.7-max", ModelKind::Assistant),
         ("moonshotai/kimi-k3", ModelKind::Assistant),
-        ("moonshotai/kimi-k2.7-code", ModelKind::Assistant),
-        ("mistralai/mistral-medium-3-5", ModelKind::Assistant),
-        ("minimax/minimax-m3", ModelKind::Assistant),
-        ("meta-llama/llama-4-maverick", ModelKind::Assistant),
-        ("z-ai/glm-5.2", ModelKind::Assistant),
-        ("z-ai/glm-5.1", ModelKind::Assistant),
-        ("z-ai/glm-5-turbo", ModelKind::Assistant),
-        ("z-ai/glm-5", ModelKind::Assistant),
-        ("z-ai/glm-5v-turbo", ModelKind::Assistant),
+        ("z-ai/glm-5.3-flash", ModelKind::Assistant),
         ("openai/gpt-image-2", ModelKind::ImageGeneration),
         ("google/gemini-3.1-flash-image", ModelKind::ImageGeneration),
-        (
-            "x-ai/grok-imagine-image-quality",
-            ModelKind::ImageGeneration,
-        ),
-        ("recraft/recraft-v4.1", ModelKind::ImageGeneration),
-        ("black-forest-labs/flux.2-pro", ModelKind::ImageGeneration),
-        ("bytedance-seed/seedream-4.5", ModelKind::ImageGeneration),
     ]
     .into_iter()
     .map(|(id, kind)| ModelOption {
@@ -108,7 +86,7 @@ impl Config {
             model_kind: model_kind_for_id(&model),
             model,
             vision_model: Some(
-                env::var("FINN_VISION_MODEL").unwrap_or_else(|_| "z-ai/glm-5v-turbo".to_owned()),
+                env::var("FINN_VISION_MODEL").unwrap_or_else(|_| "z-ai/glm-5.3-flash".to_owned()),
             ),
             reasoning_effort: env::var("FINN_REASONING").unwrap_or_else(|_| "medium".to_owned()),
             home,
@@ -144,11 +122,11 @@ mod tests {
     fn fallback_catalog_contains_assistant_and_image_models() {
         let models = fallback_model_options();
         assert!(models.contains(&ModelOption {
-            id: "openai/gpt-5.5".to_owned(),
+            id: "deepseek/deepseek-v4-pro".to_owned(),
             kind: ModelKind::Assistant,
         }));
         assert!(models.contains(&ModelOption {
-            id: "z-ai/glm-5.2".to_owned(),
+            id: "z-ai/glm-5.3-flash".to_owned(),
             kind: ModelKind::Assistant,
         }));
         assert!(models.contains(&ModelOption {
@@ -163,5 +141,10 @@ mod tests {
             model_kind_for_id("openai/gpt-image-2"),
             ModelKind::ImageGeneration
         );
+        assert_eq!(
+            model_kind_for_id("google/gemini-3.1-flash-image"),
+            ModelKind::ImageGeneration
+        );
+        assert_eq!(models.len(), 6);
     }
 }

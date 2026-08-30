@@ -8,35 +8,13 @@ use serde_json::Value;
 use crate::config::{ModelKind, ModelOption, fallback_model_options, provider_connection};
 
 const OPENROUTER_ASSISTANT_MODELS: &[&str] = &[
-    "openai/gpt-5.5",
-    "openai/gpt-5.4-mini",
-    "anthropic/claude-sonnet-5",
-    "anthropic/claude-opus-4.8",
-    "google/gemini-3.5-flash",
-    "x-ai/grok-4.3",
     "deepseek/deepseek-v4-pro",
     "deepseek/deepseek-v4-flash",
-    "qwen/qwen3.7-max",
     "moonshotai/kimi-k3",
-    "moonshotai/kimi-k2.7-code",
-    "mistralai/mistral-medium-3-5",
-    "minimax/minimax-m3",
-    "meta-llama/llama-4-maverick",
-    "z-ai/glm-5.2",
-    "z-ai/glm-5.1",
-    "z-ai/glm-5-turbo",
-    "z-ai/glm-5",
-    "z-ai/glm-5v-turbo",
+    "z-ai/glm-5.3-flash",
 ];
 
-const OPENROUTER_IMAGE_MODELS: &[&str] = &[
-    "openai/gpt-image-2",
-    "google/gemini-3.1-flash-image",
-    "x-ai/grok-imagine-image-quality",
-    "recraft/recraft-v4.1",
-    "black-forest-labs/flux.2-pro",
-    "bytedance-seed/seedream-4.5",
-];
+const OPENROUTER_IMAGE_MODELS: &[&str] = &["openai/gpt-image-2", "google/gemini-3.1-flash-image"];
 
 pub struct ModelCatalog {
     pub models: Vec<ModelOption>,
@@ -163,27 +141,25 @@ mod tests {
     fn parses_and_filters_provider_catalogs() {
         let openrouter = parse_models(
             r#"{"data":[
-                {"id":"z-ai/glm-5.2","architecture":{"output_modalities":["text"]},"supported_parameters":["tools"]},
+                {"id":"z-ai/glm-5.3-flash","architecture":{"output_modalities":["text"]},"supported_parameters":["tools"]},
                 {"id":"moonshotai/kimi-k3","architecture":{"output_modalities":["text"]},"supported_parameters":["tools"]},
+                {"id":"deepseek/deepseek-v4-pro","architecture":{"output_modalities":["text"]},"supported_parameters":["tools"]},
                 {"id":"deepseek/deepseek-v4-flash","architecture":{"output_modalities":["text"]},"supported_parameters":["tools"]},
                 {"id":"openai/gpt-image-2","architecture":{"output_modalities":["image"]},"supported_parameters":[]},
+                {"id":"google/gemini-3.1-flash-image","architecture":{"output_modalities":["image"]},"supported_parameters":[]},
                 {"id":"openai/gpt-5.5","architecture":{"output_modalities":["text"]},"supported_parameters":["tools"]}
             ]}"#,
         )
         .unwrap();
-        assert_eq!(openrouter.len(), 5);
-        assert!(
-            openrouter.iter().any(|model| {
-                model.id == "openai/gpt-5.5" && model.kind == ModelKind::Assistant
-            })
-        );
-        assert!(
-            openrouter
-                .iter()
-                .any(|model| { model.id == "z-ai/glm-5.2" && model.kind == ModelKind::Assistant })
-        );
+        assert_eq!(openrouter.len(), 6);
+        assert!(openrouter.iter().any(|model| {
+            model.id == "z-ai/glm-5.3-flash" && model.kind == ModelKind::Assistant
+        }));
         assert!(openrouter.iter().any(|model| {
             model.id == "moonshotai/kimi-k3" && model.kind == ModelKind::Assistant
+        }));
+        assert!(openrouter.iter().any(|model| {
+            model.id == "deepseek/deepseek-v4-pro" && model.kind == ModelKind::Assistant
         }));
         assert!(openrouter.iter().any(|model| {
             model.id == "deepseek/deepseek-v4-flash" && model.kind == ModelKind::Assistant
@@ -191,5 +167,9 @@ mod tests {
         assert!(openrouter.iter().any(|model| {
             model.id == "openai/gpt-image-2" && model.kind == ModelKind::ImageGeneration
         }));
+        assert!(openrouter.iter().any(|model| {
+            model.id == "google/gemini-3.1-flash-image" && model.kind == ModelKind::ImageGeneration
+        }));
+        assert!(!openrouter.iter().any(|model| model.id == "openai/gpt-5.5"));
     }
 }
